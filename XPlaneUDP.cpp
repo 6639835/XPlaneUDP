@@ -34,7 +34,7 @@ XPlaneUdp::~XPlaneUdp () {
 }
 
 /**
- * @brief 关闭udp后接发无法使用 !
+ * @brief 关闭udp后接发无法使用
  */
 void XPlaneUdp::close () {
     // 关闭线程
@@ -43,6 +43,8 @@ void XPlaneUdp::close () {
     if (ioThread.joinable())
         ioThread.join();
     // 停止udp接收
+    if (timeout) // 由socket丢失引发的close() 或 已调用close()
+        return;
     shared_lock<shared_mutex> lock{datarefMutex};
     vector<string> allDatarefs;
     for (auto &item : dataref.right)
@@ -53,11 +55,13 @@ void XPlaneUdp::close () {
     for (auto &item : allDatarefs)
         addDataref(item, 0);
     io_context.poll();
+    timeout.store(true);
 }
 
 
 /**
- * @brief 获取是否 XPlaneTimeOut
+ * @brief 获取状态
+ * @return 返回是否 XPlaneTimeOut
  */
 bool XPlaneUdp::getState () {
     return timeout;
@@ -76,11 +80,10 @@ void XPlaneUdp::startReceive () {
         } catch (const XPlaneTimeout &e) {
             cerr << e.what();
             timeout.store(true);
-            continue;
+            break;
         }
         if (length < 5)
             continue;
-        timeout.store(false);
         handleReceive({udpReceive.begin(), udpReceive.begin() + length});
     }
 }
