@@ -153,6 +153,8 @@ void XPlaneUdp::autoUdpFind () {
  */
 void XPlaneUdp::handleReceive (vector<char> received) {
     if (equal(DATAREF_GET_HEAD.begin(), DATAREF_GET_HEAD.begin() + 4, received.begin())) { // dataref,文档有误实际返回 RREF,
+        if ((received.size() - 5) % 8 != 0)
+            return;
         unique_lock<mutex> lock{latestDatarefMutex};
         for (int i = HEADER_LENGTH; i < received.size(); i += 8) {
             int index;
@@ -161,6 +163,8 @@ void XPlaneUdp::handleReceive (vector<char> received) {
             latestDataref[index] = value;
         }
     } else if (equal(BASIC_INFO_HEAD.begin(), BASIC_INFO_HEAD.begin() + 4, received.begin())) { // 基本信息
+        if ((received.size() - 5) % 64 != 0)
+            return;
         receivedInfo.store(true);
         unique_lock<mutex> lock{latestBasicInfoMutex};
         unpack(received, HEADER_LENGTH, latestBasicInfo);

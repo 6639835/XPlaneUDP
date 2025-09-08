@@ -128,6 +128,8 @@ class XPlaneUdp {
  */
 template <typename T>
 void XPlaneUdp::sendUdpData (T buffer) {
+    if (timeout)
+        return;
     asio::post(strand_, [this, copyBuffer=move(buffer)] () {
         localSocket.async_send_to(asio::buffer(copyBuffer), remoteEndpoint, asio::bind_executor(strand_,
                                       [](const sys::error_code &, std::size_t)-> void {}));
