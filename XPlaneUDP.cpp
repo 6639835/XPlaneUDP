@@ -296,7 +296,7 @@ void XPlaneUdp::handleReceive (vector<char> received) {
  */
 void XPlaneUdp::addDataref (const string &dataRef, const int32_t freq, const int index) {
     string combineName{(index != -1) ? (dataRef + '[' + to_string(index) + ']') : dataRef};
-    unique_lock<mutex> locky(datarefIndexMutex);
+    unique_lock<mutex> indexLock(datarefIndexMutex);
     
     // 检查整数溢出
     if (datarefIndex >= INT32_MAX) {
@@ -304,16 +304,21 @@ void XPlaneUdp::addDataref (const string &dataRef, const int32_t freq, const int
                                  std::to_string(datarefIndex) + " at maximum");
     }
     
+    // 保存当前索引，确保即使早期返回也会递增
+    int32_t currentIndex = datarefIndex;
+    ++datarefIndex; // 先递增索引，确保不会被重复使用
+    
     if (unique_lock<shared_mutex> lock{datarefMutex}; freq == 0) {
         dataref.right.erase(combineName);
         if (dataref.size() == 1) // 始终保留一个dataref维持udp通信
             return;
-    } else
-        dataref.insert({datarefIndex, combineName});
+    } else {
+        dataref.insert({currentIndex, combineName});
+    }
+    
     array<char, 413> buffer{};
-    pack(buffer, 0, DATAREF_GET_HEAD, freq, datarefIndex, combineName);
+    pack(buffer, 0, DATAREF_GET_HEAD, freq, currentIndex, combineName);
     sendUdpData(buffer);
-    ++datarefIndex;
 }
 
 /**
