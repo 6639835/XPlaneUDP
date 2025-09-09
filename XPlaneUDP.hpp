@@ -5,6 +5,7 @@
 #include <iomanip>
 #include <string>
 #include <exception>
+#include <chrono>
 #include <boost/asio/steady_timer.hpp>
 #include <boost/system.hpp>
 #include <boost/asio.hpp>
@@ -116,6 +117,7 @@ class XPlaneUdp {
         // 网络
         void autoUdpFind ();
         void startReceive ();
+        void startReceiveAsync ();
         void handleReceive (std::vector<char> received);
         template <typename T>
         void sendUdpData (T buffer);

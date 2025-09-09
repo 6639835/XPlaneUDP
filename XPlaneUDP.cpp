@@ -25,13 +25,19 @@ XPlaneUdp::XPlaneUdp (): localSocket(io_context), strand_(io_context.get_executo
     localSocket.open(local.protocol());
     localSocket.bind(local);
     
-    // 启动接收线程
-    ioThread = thread([this] () { startReceive(); });
+    // 启动接收线程和io_context线程
+    ioThread = thread([this] () { 
+        // 在IO线程中运行io_context
+        io_context.run();
+    });
     
-    // 保持udp连接 (moved after thread start to avoid race)
+    // 保持udp连接
     addDataref("sim/network/misc/network_time_sec");
-    io_context.reset();
-    io_context.run();
+    
+    // 启动接收
+    asio::post(strand_, [this]() {
+        startReceiveAsync();
+    });
 }
 
 XPlaneUdp::~XPlaneUdp () {
@@ -45,6 +51,7 @@ void XPlaneUdp::close () {
     // 关闭线程
     runThread.store(false);
     localSocket.cancel();
+    io_context.stop(); // Stop the io_context
     if (ioThread.joinable())
         ioThread.join();
     
@@ -56,6 +63,9 @@ void XPlaneUdp::close () {
         for (auto &item : dataref.right)
             allDatarefs.emplace_back(item.first);
     } // 锁在这里释放
+    
+    // Reset and restart io_context for cleanup operations
+    io_context.restart();
     
     // 现在可以安全地调用其他函数，不会造成死锁
     try {
@@ -101,14 +111,51 @@ void XPlaneUdp::startReceive () {
 }
 
 /**
+ * @brief 异步接收UDP数据 (新版本，在io_context线程中运行)
+ */
+void XPlaneUdp::startReceiveAsync() {
+    if (!runThread.load()) return;
+    
+    auto receiveBuffer = std::make_shared<UdpBuffer>();
+    auto senderEndpoint = std::make_shared<ip::udp::endpoint>();
+    
+    localSocket.async_receive_from(
+        asio::buffer(*receiveBuffer), *senderEndpoint,
+        asio::bind_executor(strand_, [this, receiveBuffer, senderEndpoint](
+            const sys::error_code& error, std::size_t bytesReceived) {
+            
+            if (!runThread.load()) return;
+            
+            if (!error && bytesReceived >= 5) {
+                timeout.store(false);
+                handleReceive({receiveBuffer->begin(), receiveBuffer->begin() + bytesReceived});
+            } else if (error != asio::error::operation_aborted) {
+                timeout.store(true);
+                cerr << "Receive error: " << error.message() << endl;
+            }
+            
+            // 继续接收下一个数据包
+            startReceiveAsync();
+        })
+    );
+}
+
+/**
  * @brief 寻找电脑上运行的 XPlane 实例
  */
+/**
+ * @brief 寻找电脑上运行的 XPlane 实例 (同步版本，用于构造函数)
+ */
 void XPlaneUdp::autoUdpFind () {
+    // 创建临时的 io_context 用于同步操作
+    asio::io_context temp_io_context;
+    
     // 创建 UDP 并允许端口复用
-    ip::udp::socket multicastSocket(io_context);
+    ip::udp::socket multicastSocket(temp_io_context);
     multicastSocket.open(ip::udp::v4());
     asio::socket_base::reuse_address option(true);
     multicastSocket.set_option(option);
+    
     // 绑定至多播
     ip::udp::endpoint multicastEndpoint;
     if (IS_WIN)
@@ -118,19 +165,46 @@ void XPlaneUdp::autoUdpFind () {
     multicastSocket.bind(multicastEndpoint);
     ip::address_v4 multicast_address = ip::make_address_v4(MULTI_CAST_GROUP);
     multicastSocket.set_option(ip::multicast::join_group(multicast_address));
-    // 接收数据
+    
+    // 使用同步接收，设置超时
     UdpBuffer buffer{};
     ip::udp::endpoint senderEndpoint;
     size_t bytesReceived;
-    try {
-        bytesReceived = receiveUdpData(buffer, multicastSocket, senderEndpoint, 3000);
-    } catch ([[maybe_unused]] const XPlaneTimeout &e) {
-        throw XPlaneIpNotFound();
+    
+    // 设置超时
+    multicastSocket.non_blocking(true);
+    
+    // 尝试接收数据，使用轮询方式实现超时
+    auto start_time = std::chrono::steady_clock::now();
+    const auto timeout_duration = std::chrono::milliseconds(3000);
+    
+    while (true) {
+        sys::error_code ec;
+        bytesReceived = multicastSocket.receive_from(asio::buffer(buffer), senderEndpoint, 0, ec);
+        
+        if (!ec && bytesReceived > 0) {
+            break; // 成功接收到数据
+        }
+        
+        if (ec != asio::error::would_block) {
+            // 发生其他错误
+            throw XPlaneIpNotFound();
+        }
+        
+        // 检查是否超时
+        if (std::chrono::steady_clock::now() - start_time > timeout_duration) {
+            throw XPlaneIpNotFound();
+        }
+        
+        // 短暂等待后重试
+        std::this_thread::sleep_for(std::chrono::milliseconds(10));
     }
+    
     cout << "XPlane Beacon: ";
     for (size_t i = 0; i < bytesReceived; i++)
         cout << hex << setw(2) << setfill('0') << (static_cast<unsigned int>(buffer[i]) & 0xff);
     cout << endl;
+    
     // 解析数据
     if ((bytesReceived < 5 + 16) || (string_view{buffer.data(), 5} != BECON_HEAD)) { // 非xp数据
         cerr << "Unknown packet from " << senderEndpoint << endl;
