@@ -163,7 +163,7 @@ void XPlaneUdp::handleReceive (vector<char> received) {
             latestDataref[index] = value;
         }
     } else if (equal(BASIC_INFO_HEAD.begin(), BASIC_INFO_HEAD.begin() + 4, received.begin())) { // 基本信息
-        if ((received.size() - 5) % 64 != 0)
+        if (((received.size() - 5) % 64 != 0) || (received.size() <= 6))
             return;
         receivedInfo.store(true);
         unique_lock<mutex> lock{latestBasicInfoMutex};
@@ -186,9 +186,9 @@ void XPlaneUdp::addDataref (const string &dataRef, const int32_t freq, const int
             return;
     } else
         dataref.insert({datarefIndex, combineName});
-    array<char, 413> buffer{};
+    vector<char> buffer(413);
     pack(buffer, 0, DATAREF_GET_HEAD, freq, datarefIndex, combineName);
-    sendUdpData(buffer);
+    sendUdpData(move(buffer));
     ++datarefIndex;
 }
 
@@ -199,10 +199,10 @@ void XPlaneUdp::addDataref (const string &dataRef, const int32_t freq, const int
  * @param index 目标为数组时的索引
  */
 void XPlaneUdp::setDataref (const std::string &dataRef, const float value, const int index) {
-    array<char, 509> buffer{};
+    vector<char> buffer(509);
     const string combineName{(index != -1) ? (dataRef + '[' + to_string(index) + ']') : dataRef};
     pack(buffer, 0, DATAREF_SET_HEAD, value, combineName, '\x00');
-    sendUdpData(buffer);
+    sendUdpData(move(buffer));
 }
 
 /**
