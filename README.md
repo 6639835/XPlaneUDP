@@ -2,7 +2,7 @@ XPlane UDP
 ===============================
 与 XPlane 的异步通信，线程安全
 
-测试环境：Win11(64)、XPlane12、C++17、Boost1.78、MinGW10.3
+测试环境：Win11(64)、XPlane12、C++17、Boost1.78、MinGW11.0
 
 ### 支持
 
