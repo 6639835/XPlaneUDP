@@ -1,8 +1,8 @@
 XPlane UDP
 ===============================
-与 XPlane 的异步通信，线程安全
+支持与 XPlane 通信
 
-测试环境：Win11(64)、XPlane12、C++17、Boost1.78、MinGW11.0
+测试通过环境：Win11(64)、XPlane12、C++20、Boost1.89、MinGW13.1
 
 ### 支持
 
@@ -11,8 +11,6 @@ XPlane UDP
 - Dataref 收发
 
 ### 参考
-
-- **charlylima/XPlaneUDP** 部分代码
 
 *  "X-Plane 12\Resources\plugins\Commands.txt"
 *  "X-Plane 12\Resources\plugins\DataRefs.txt"

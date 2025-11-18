@@ -10,7 +10,63 @@ static constexpr std::string MULTI_CAST_GROUP{"239.255.1.1"};
 static constexpr unsigned short MULTI_CAST_PORT{49707};
 
 
-XPlaneUdp::XPlaneUdp () : workGuard(asio::make_work_guard(io_context)) {}
+XPlaneUdp::XPlaneUdp (const bool autoReConnect) : autoReconnect(autoReConnect),
+                                                  workGuard(asio::make_work_guard(io_context)),
+                                                  worker([this] () { io_context.run(); }) {
+    // 监听信标帧
+    multicastSocket.open(ip::udp::v4());
+    const asio::socket_base::reuse_address option(true);
+    multicastSocket.set_option(option);
+    ip::udp::endpoint multicastEndpoint;
+    if (IS_WIN)
+        multicastEndpoint = ip::udp::endpoint(ip::udp::v4(), MULTI_CAST_PORT);
+    else
+        multicastEndpoint = ip::udp::endpoint(ip::make_address(MULTI_CAST_GROUP), MULTI_CAST_PORT);
+    multicastSocket.bind(multicastEndpoint);
+    const ip::address_v4 multicast_address = ip::make_address_v4(MULTI_CAST_GROUP);
+    multicastSocket.set_option(ip::multicast::join_group(multicast_address));
+    detectBeacon();
+}
+
+XPlaneUdp::~XPlaneUdp () {
+    workGuard.reset();
+    io_context.stop();
+    if (worker.joinable()) {
+        worker.join();
+    }
+}
+
+/**
+ * @brief 设置一个回调函数,xp连接状态改变时会调用
+ * @param callbackFunc 回调函数 接受形参bool
+ */
+void XPlaneUdp::setCallback (const std::function<void  (bool)> &callbackFunc) {
+    callback = callbackFunc;
+}
+
+/**
+ * @brief 重连
+ */
+void XPlaneUdp::reconnect () {
+    // dataref
+    for (const auto &[name, start, end, freq, available, isArray] : dataRefs) {
+        if (!available)
+            continue;
+        for (int i = start; i <= end; ++i) {
+            std::vector<char> buffer(413);
+            if (isArray)
+                pack(buffer, 0, DATAREF_GET_HEAD, freq, i, name);
+            else
+                pack(buffer, 0, DATAREF_GET_HEAD, freq, i, std::format("{}[{}]", name, i));
+            sendData(buffer);
+        }
+    }
+    // 信息
+    const std::string sentence = std::format("{}{}\x00", BASIC_INFO_HEAD, infoFreq);
+    std::vector<char> buffer(sentence.size());
+    pack(buffer, 0, sentence);
+    sendData(std::move(buffer));
+}
 
 /**
  * @brief 新增监听目标
@@ -29,7 +85,7 @@ XPlaneUdp::DatarefIndex XPlaneUdp::addDataref (const std::string &dataref, int32
     std::vector<char> buffer(413);
     pack(buffer, 0, DATAREF_GET_HEAD, freq, start, name);
     sendData(std::move(buffer));
-    exist[name] = dataref.size() - 1;
+    exist[name] = dataRefs.size() - 1;
     return {dataRefs.size() - 1};
 }
 
@@ -125,6 +181,7 @@ void XPlaneUdp::setDataref (const std::string &dataref, const float value, int i
  * @param freq 接收频率
  */
 void XPlaneUdp::addPlaneInfo (int freq) {
+    infoFreq = freq;
     const std::string sentence = std::format("{}{}\x00", BASIC_INFO_HEAD, freq);
     std::vector<char> buffer(sentence.size());
     pack(buffer, 0, sentence);
@@ -139,21 +196,17 @@ void XPlaneUdp::getPlaneInfo (PlaneInfo &infoDst) const {
 }
 
 /**
- * @brief 监听XPlane是否在线
+ * @brief 设置xp状态 触发回调
+ * @param newState 新状态
  */
-void XPlaneUdp::detect () {
-    // 绑定到多播
-    multicastSocket.open(ip::udp::v4());
-    const asio::socket_base::reuse_address option(true);
-    multicastSocket.set_option(option);
-    ip::udp::endpoint multicastEndpoint;
-    if (IS_WIN)
-        multicastEndpoint = ip::udp::endpoint(ip::udp::v4(), MULTI_CAST_PORT);
-    else
-        multicastEndpoint = ip::udp::endpoint(ip::make_address(MULTI_CAST_GROUP), MULTI_CAST_PORT);
-    multicastSocket.bind(multicastEndpoint);
-    const ip::address_v4 multicast_address = ip::make_address_v4(MULTI_CAST_GROUP);
-    multicastSocket.set_option(ip::multicast::join_group(multicast_address));
+void XPlaneUdp::setState (const bool newState) {
+    if (newState == state)
+        return;
+    if (newState && autoReconnect)
+        reconnect();
+    state = newState;
+    if (callback)
+        callback(newState);
 }
 
 /**
@@ -190,16 +243,39 @@ void XPlaneUdp::extendSpace () {
 }
 
 /**
+ * @brief 监听XPlane是否在线
+ */
+void XPlaneUdp::detectBeacon () {
+    asio::co_spawn(io_context, detect(), asio::detached);
+}
+
+asio::awaitable<void> XPlaneUdp::detect () {
+    std::array<char, 1024> receiveBuffer{};
+    ip::udp::endpoint senderEndpoint;
+    asio::steady_timer timer(co_await asio::this_coro::executor);
+    while (true) {
+        timer.expires_after(std::chrono::seconds(2));
+        timer.async_wait([this](const auto &ec) { if (!ec)setState(false); });
+        size_t bytes_received = co_await multicastSocket.async_receive_from(
+            asio::buffer(receiveBuffer), senderEndpoint, asio::use_awaitable);
+        receiveDataProcess({receiveBuffer.begin(), receiveBuffer.begin() + bytes_received}, senderEndpoint);
+        timer.cancel();
+    }
+}
+
+/**
  * @brief 向xp发送udp数据
  * @param data 数据
  */
 void XPlaneUdp::sendData (std::vector<char> data) {
-    asio::co_spawn(io_context, send(std::move(data)), asio::detached);
+    if (!xpSocket.is_open())
+        return;
+    const auto buffer = std::make_shared<std::vector<char>>(std::move(data));
+    asio::co_spawn(io_context, send(buffer), asio::detached);
 }
 
-asio::awaitable<void> XPlaneUdp::send (std::vector<char> &&data) {
-    const auto buffer = std::make_shared<std::vector<char>>(std::move(data));
-    co_await xpSocket.async_send_to(asio::buffer(*buffer), xpEndpoint, asio::use_awaitable);
+asio::awaitable<void> XPlaneUdp::send (const std::shared_ptr<std::vector<char>> data) {
+    co_await xpSocket.async_send_to(asio::buffer(*data), xpEndpoint, asio::use_awaitable);
 }
 
 /**
@@ -210,18 +286,18 @@ void XPlaneUdp::receiveData () {
 }
 
 asio::awaitable<void> XPlaneUdp::receive () {
-    ip::udp::endpoint xpSend;
+    ip::udp::endpoint temp;
     std::array<char, 1472> receiveBuffer{};
     while (xpSocket.is_open()) {
-        // 这里非常非常怪 应该是 std::tuple<boost::system::error_code, unsigned long long>
+        // 这里非常非常怪 提示 std::tuple<boost::system::error_code, unsigned long long>
         size_t bytes_received = co_await xpSocket.async_receive_from(
-            asio::buffer(receiveBuffer), xpSend, asio::use_awaitable);
-        receiveDataProcess({receiveBuffer.begin(), receiveBuffer.begin() + bytes_received});
+            asio::buffer(receiveBuffer), temp, asio::use_awaitable);
+        receiveDataProcess({receiveBuffer.begin(), receiveBuffer.begin() + bytes_received}, temp);
     }
 }
 
-void XPlaneUdp::receiveDataProcess (std::vector<char> data) {
-    if (equal(DATAREF_GET_HEAD.begin(), DATAREF_GET_HEAD.begin() + 4, data.begin())) { // dataref,文档有误实际返回 RREF,
+void XPlaneUdp::receiveDataProcess (std::vector<char> data, const ip::udp::endpoint &sender) {
+    if (std::ranges::equal(DATAREF_GET_HEAD | std::views::take(4), data | std::views::take(4))) { // dataref
         if ((data.size() - 5) % 8 != 0)
             return;
         for (int i = HEADER_LENGTH; i < data.size(); i += 8) {
@@ -230,9 +306,23 @@ void XPlaneUdp::receiveDataProcess (std::vector<char> data) {
             unpack(data, i, index, value);
             values[index] = value;
         }
-    } else if (equal(BASIC_INFO_HEAD.begin(), BASIC_INFO_HEAD.begin() + 4, data.begin())) { // 基本信息
+    } else if (std::ranges::equal(BASIC_INFO_HEAD | std::views::take(4), data | std::views::take(4))) { // 基本信息
         if (((data.size() - 5) % 64 != 0) || (data.size() <= 6))
             return;
         unpack(data, HEADER_LENGTH, info);
+    } else if (std::ranges::equal(BECON_HEAD | std::views::take(4), data | std::views::take(4))) { // 信标
+        if (!xpSocket.is_open()) { // 第一次听见信标
+            uint8_t mainVer, minorVer;
+            int32_t software, xpVer;
+            uint32_t role;
+            uint16_t port;
+            unpack(data, 5, mainVer, minorVer, software, xpVer, role, port);
+            xpEndpoint = ip::udp::endpoint(ip::make_address(sender.address().to_string()), port);
+            const ip::udp::endpoint local(ip::udp::v4(), 0);
+            xpSocket.open(local.protocol());
+            xpSocket.bind(local);
+            receiveData();
+        }
+        setState(true);
     }
 }

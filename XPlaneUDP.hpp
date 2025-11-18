@@ -50,11 +50,15 @@ class XPlaneUdp {
             float vX, vY, vZ, rollRate, pitchRate, yawRate; // 三轴速度 / 横滚 俯仰 偏航
         };
 
-        XPlaneUdp ();
+        explicit XPlaneUdp (bool autoReConnect = true);
+        ~XPlaneUdp ();
         XPlaneUdp (const XPlaneUdp &) = delete;
         XPlaneUdp& operator= (const XPlaneUdp &) = delete;
         XPlaneUdp (XPlaneUdp &&) = delete;
         XPlaneUdp& operator= (XPlaneUdp &&) = delete;
+
+        void setCallback (const std::function<void  (bool)> &callbackFunc);
+        void reconnect ();
 
         DatarefIndex addDataref (const std::string &dataref, int32_t freq = 1, int index = -1);
         DatarefIndex addDatarefArray (const std::string &dataref, int length, int32_t freq = 1);
@@ -84,20 +88,28 @@ class XPlaneUdp {
         std::unordered_map<std::string, size_t> exist;
         PlaneInfo info{.track = -1};
         // 网络
+        bool autoReconnect; // 自动重连
         asio::io_context io_context{}; // 上下文
         asio::executor_work_guard<asio::io_context::executor_type> workGuard;
         ip::udp::socket multicastSocket{io_context}; // 监听多播
         ip::udp::socket xpSocket{io_context}; // xp通信
         ip::udp::endpoint xpEndpoint; // xp端口
+        std::thread worker; // io_content驱动
+        int infoFreq{}; // 基本信息频率
+        // 回调
+        bool state{false}; // xp状态
+        std::function<void  (bool)> callback{}; // 回调
 
-        void detect ();
+        void setState (bool newState);
         size_t findSpace (size_t length);
         void extendSpace ();
+        void detectBeacon ();
+        asio::awaitable<void> detect ();
         void sendData (std::vector<char> data);
-        asio::awaitable<void> send (std::vector<char> &&data);
-        void receiveData();
+        asio::awaitable<void> send (std::shared_ptr<std::vector<char>> data);
+        void receiveData ();
         asio::awaitable<void> receive ();
-        void receiveDataProcess(std::vector<char> data);
+        void receiveDataProcess (std::vector<char> data, const ip::udp::endpoint &sender);
 };
 
 /**
