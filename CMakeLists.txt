@@ -1,12 +1,11 @@
-cmake_minimum_required(VERSION 3.29)
+cmake_minimum_required(VERSION 4.0)
 project(XPlaneUDP)
 
-set(CMAKE_CXX_STANDARD 17)
-include_directories(D:\\boost_1_78_0)
+set(CMAKE_CXX_STANDARD 20)
 
-find_package(Boost)
+find_package(Boost REQUIRED)
+include_directories(${Boost_INCLUDE_DIRS})
 
-# 可运行
 add_executable(XPlaneUDP main.cpp
         XPlaneUDP.cpp
         XPlaneUDP.hpp

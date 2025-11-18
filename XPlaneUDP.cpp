@@ -6,364 +6,233 @@ constexpr bool IS_WIN = true;
 constexpr bool IS_WIN = false;
 #endif
 
-using namespace std;
-
-constexpr int HEADER_LENGTH{5}; // 指令头部长度 4字母+1空
-const static string DATAREF_GET_HEAD{'R', 'R', 'E', 'F', '\x00'};
-const static string DATAREF_SET_HEAD{'D', 'R', 'E', 'F', '\x00'};
-const static string BASIC_INFO_HEAD{'R', 'P', 'O', 'S', '\x00'};
-const static string BECON_HEAD{'B', 'E', 'C', 'N', '\x00'};
+static constexpr std::string MULTI_CAST_GROUP{"239.255.1.1"};
+static constexpr unsigned short MULTI_CAST_PORT{49707};
 
 
-XPlaneUdp::XPlaneUdp (): localSocket(io_context), strand_(io_context.get_executor()) {
-    // 绑定xplane
-    autoUdpFind();
-    ip::udp::endpoint local(ip::udp::v4(), 0);
-    localSocket.open(local.protocol());
-    localSocket.bind(local);
-    // 保持udp连接
-    addDataref("sim/network/misc/network_time_sec");
-    io_context.reset();
-    io_context.run();
-    // 启动接收
-    ioThread = thread([this] () { startReceive(); });
-}
-
-XPlaneUdp::~XPlaneUdp () {
-    close();
-}
-
-/**
- * @brief 关闭udp后接发无法使用
- */
-void XPlaneUdp::close () {
-    // 关闭线程
-    runThread.store(false);
-    localSocket.cancel();
-    if (ioThread.joinable())
-        ioThread.join();
-    // 停止udp接收
-    if (timeout) // 由socket丢失引发的close() 或 已调用close()
-        return;
-    shared_lock<shared_mutex> lock{datarefMutex};
-    vector<string> allDatarefs;
-    for (auto &item : dataref.right)
-        allDatarefs.emplace_back(item.first);
-    lock.unlock();
-    addBasicInfo(0);
-    addDataref("inop");
-    for (auto &item : allDatarefs)
-        addDataref(item, 0);
-    io_context.poll();
-    timeout.store(true);
-}
-
-
-/**
- * @brief 获取状态
- * @return 返回是否 XPlaneTimeOut
- */
-bool XPlaneUdp::getState () {
-    return timeout;
-}
-
-/**
- * @brief 开始接收异步接收
- */
-void XPlaneUdp::startReceive () {
-    ip::udp::endpoint temp{};
-    UdpBuffer udpReceive{};
-    size_t length;
-    while (runThread) {
-        try {
-            length = receiveUdpData(udpReceive, localSocket, temp, 3000);
-        } catch (const XPlaneTimeout &e) {
-            cerr << e.what();
-            timeout.store(true);
-            break;
-        }
-        if (length < 5)
-            continue;
-        handleReceive({udpReceive.begin(), udpReceive.begin() + length});
-    }
-}
-
-/**
- * @brief 寻找电脑上运行的 XPlane 实例
- */
-void XPlaneUdp::autoUdpFind () {
-    // 创建 UDP 并允许端口复用
-    ip::udp::socket multicastSocket(io_context);
-    multicastSocket.open(ip::udp::v4());
-    asio::socket_base::reuse_address option(true);
-    multicastSocket.set_option(option);
-    // 绑定至多播
-    ip::udp::endpoint multicastEndpoint;
-    if (IS_WIN)
-        multicastEndpoint = ip::udp::endpoint(ip::udp::v4(), MULTI_CAST_PORT);
-    else
-        multicastEndpoint = ip::udp::endpoint(ip::make_address(MULTI_CAST_GROUP), MULTI_CAST_PORT);
-    multicastSocket.bind(multicastEndpoint);
-    ip::address_v4 multicast_address = ip::make_address_v4(MULTI_CAST_GROUP);
-    multicastSocket.set_option(ip::multicast::join_group(multicast_address));
-    // 接收数据
-    UdpBuffer buffer{};
-    ip::udp::endpoint senderEndpoint;
-    size_t bytesReceived;
-    try {
-        bytesReceived = receiveUdpData(buffer, multicastSocket, senderEndpoint, 3000);
-    } catch ([[maybe_unused]] const XPlaneTimeout &e) {
-        throw XPlaneIpNotFound();
-    }
-    cout << "XPlane Beacon: ";
-    for (size_t i = 0; i < bytesReceived; i++)
-        cout << hex << setw(2) << setfill('0') << (static_cast<unsigned int>(buffer[i]) & 0xff);
-    cout << endl;
-    // 解析数据
-    if ((bytesReceived < 5 + 16) || (string_view{buffer.data(), 5} != BECON_HEAD)) { // 非xp数据
-        cerr << "Unknown packet from " << senderEndpoint << endl;
-        cout << buffer.size() << " bytes" << endl;
-        for (const auto &byte : buffer)
-            cout << hex << setw(2) << setfill('0') << (static_cast<unsigned int>(byte) & 0xff);
-        cout << endl;
-    } else { // xp数据
-        string_view data{buffer.data() + 5, 16};
-        uint8_t mainVer, minorVer;
-        int32_t software, xpVer;
-        uint32_t role;
-        uint16_t port;
-        unpack(data, 0, mainVer, minorVer, software, xpVer, role, port);
-        if ((mainVer == 1) && (minorVer <= 2) && (software == 1)) {
-            cout << "XPlane Beacon Version: " << static_cast<int>(mainVer) << '.' << static_cast<int>(minorVer) << '.'
-                    << software << endl;
-            cout << dec << "IP: " << senderEndpoint.address() << ", Port: " << port << ", hostname: " << string_view{
-                buffer.data() + 21, bytesReceived - 24
-            } << ", XPlaneVersion: " << xpVer << ", role: " << role << endl;
-            this->remoteEndpoint = ip::udp::endpoint(ip::make_address(senderEndpoint.address().to_string()), port);
-        } else {
-            cerr << "XPlane Beacon Version not supported: " << mainVer << '.' << minorVer << '.' << software << endl;
-            throw XPlaneVersionNotSupported();
-        }
-    }
-}
-
-/**
- * @brief 处理接收到的udp数据
- * @param received 接收数据
- */
-void XPlaneUdp::handleReceive (vector<char> received) {
-    if (equal(DATAREF_GET_HEAD.begin(), DATAREF_GET_HEAD.begin() + 4, received.begin())) { // dataref,文档有误实际返回 RREF,
-        if ((received.size() - 5) % 8 != 0)
-            return;
-        unique_lock<mutex> lock{latestDatarefMutex};
-        for (int i = HEADER_LENGTH; i < received.size(); i += 8) {
-            int index;
-            float value;
-            unpack(received, i, index, value);
-            latestDataref[index] = value;
-        }
-    } else if (equal(BASIC_INFO_HEAD.begin(), BASIC_INFO_HEAD.begin() + 4, received.begin())) { // 基本信息
-        if (((received.size() - 5) % 64 != 0) || (received.size() <= 6))
-            return;
-        receivedInfo.store(true);
-        unique_lock<mutex> lock{latestBasicInfoMutex};
-        unpack(received, HEADER_LENGTH, latestBasicInfo);
-    }
-}
+XPlaneUdp::XPlaneUdp () : workGuard(asio::make_work_guard(io_context)) {}
 
 /**
  * @brief 新增监听目标
- * @param dataRef dataref 名称
- * @param freq 频率, 0时停止
+ * @param dataref dataref 名称
+ * @param freq 频率
  * @param index 目标为数组时的索引
  */
-void XPlaneUdp::addDataref (const string &dataRef, const int32_t freq, const int index) {
-    string combineName{(index != -1) ? (dataRef + '[' + to_string(index) + ']') : dataRef};
-    unique_lock<mutex> locky(datarefIndexMutex);
-    if (unique_lock<shared_mutex> lock{datarefMutex}; freq == 0) {
-        dataref.right.erase(combineName);
-        if (dataref.size() == 1) // 始终保留一个dataref维持udp通信
-            return;
-    } else
-        dataref.insert({datarefIndex, combineName});
-    vector<char> buffer(413);
-    pack(buffer, 0, DATAREF_GET_HEAD, freq, datarefIndex, combineName);
-    sendUdpData(move(buffer));
-    ++datarefIndex;
-}
-
-/**
- * @brief 设置dataref值
- * @param dataRef dataref 名称
- * @param value 值
- * @param index 目标为数组时的索引
- */
-void XPlaneUdp::setDataref (const std::string &dataRef, const float value, const int index) {
-    vector<char> buffer(509);
-    const string combineName{(index != -1) ? (dataRef + '[' + to_string(index) + ']') : dataRef};
-    pack(buffer, 0, DATAREF_SET_HEAD, value, combineName, '\x00');
-    sendUdpData(move(buffer));
+XPlaneUdp::DatarefIndex XPlaneUdp::addDataref (const std::string &dataref, int32_t freq, int index) {
+    std::string name = (index == -1) ? dataref : std::format("{}[{}]", dataref, index);
+    if (const auto it = exist.find(name); it != exist.end()) {
+        std::cerr << "already exist! nothing change.";
+        return {it->second};
+    }
+    size_t start = findSpace(1);
+    dataRefs.emplace_back(name, start, start, freq, true, false);
+    std::vector<char> buffer(413);
+    pack(buffer, 0, DATAREF_GET_HEAD, freq, start, name);
+    sendData(std::move(buffer));
+    exist[name] = dataref.size() - 1;
+    return {dataRefs.size() - 1};
 }
 
 /**
  * @brief 新增监听目标,目标为数组
- * @param dataRef dataref 名称
+ * @param dataref dataref 名称
  * @param length 数组长度
- * @param freq 频率, 0时停止
+ * @param freq 频率
  */
-void XPlaneUdp::addDatarefArray (const std::string &dataRef, const int length, const int32_t freq) {
-    const string base = dataRef + '[';
-    if (freq == 0) { // 停止接收
-        for (int i = 0; i < length; ++i)
-            addDataref(base + to_string(i) + ']', 0);
-        unique_lock<shared_mutex> lock{datarefMutex};
-        dataref.right.erase(dataRef);
-        return;
-    } else { // 新建或者更改信息
-        unique_lock<shared_mutex> lock{arrayLengthMutex};
-        if (const auto ptr = arrayLength.find(dataRef); (ptr != arrayLength.end()) && (ptr->second != length)) { // 更改长度
-            const int32_t rawLength = ptr->second;
-            for (int i = 0; i < rawLength; ++i)
-                addDataref(base + to_string(i) + ']', 0);
-            unique_lock<shared_mutex> locky{datarefMutex};
-            dataref.right.erase(dataRef);
-        }
-        arrayLength[dataRef] = length; // 然后修正长度
+XPlaneUdp::DatarefIndex XPlaneUdp::addDatarefArray (const std::string &dataref, const int length, int32_t freq) {
+    if (const auto it = exist.find(dataref); it != exist.end()) {
+        std::cerr << "already exist! nothing change.";
+        return {it->second};
     }
-    unique_lock<mutex> lock{datarefIndexMutex};
-    unique_lock<shared_mutex> locky{datarefMutex};
-    array<char, 413> buffer{};
-    dataref.insert({datarefIndex, dataRef});
-    for (int i = 1; i <= length; ++i) {
-        auto datarefWithIndex = base + to_string(i - 1) + ']';
-        dataref.insert({datarefIndex + i, datarefWithIndex});
-        pack(buffer, 0, DATAREF_GET_HEAD, freq, datarefIndex + i, datarefWithIndex);
-        sendUdpData(buffer);
-    }
-    datarefIndex += (length + 1);
-}
-
-/**
- * @brief 获取某组 dataref 最新值
- * @param dataRef dataref 名称
- * @return 数据组
- */
-optional<vector<float>> XPlaneUdp::getDatarefArray (const std::string &dataRef) {
-    const auto id = datarefArrayName2Id(dataRef);
-    if (!id.has_value())
-        return nullopt;
-    shared_lock<shared_mutex> lock{arrayLengthMutex};
-    const auto it = arrayLength.find(dataRef);
-    if (it == arrayLength.end())
-        return nullopt;
-    const int32_t length = it->second;
-    lock.unlock();
-    vector<float> container(length);
-    const int32_t startPos = id.value() + 1; // 本名占了一个
-    unique_lock<mutex> locky{latestDatarefMutex};
+    int start = static_cast<int>(findSpace(length));
+    dataRefs.emplace_back(dataref, start, start + length - 1, freq, true, true);
     for (int i = 0; i < length; ++i) {
-        const auto that = latestDataref.find(startPos + i);
-        if (that == latestDataref.end())
-            return nullopt;
-        container[i] = that->second;
+        std::string name = std::format("{}[{}]", dataref, i);
+        std::vector<char> buffer(413);
+        pack(buffer, 0, DATAREF_GET_HEAD, freq, start + i, name);
+        sendData(std::move(buffer));
     }
-    return container;
+    exist[dataref] = dataRefs.size() - 1;
+    return {dataRefs.size() - 1};
 }
 
 /**
- * @brief 获取某组 dataref 最新值
- * @param id dataref 索引
- * @return 数据组
+ * @brief 获取 dataref 最新值
+ * @param dataref 标识
+ * @param value 返回值
+ * @param defaultValue 默认值
+ * @return 值可用
  */
-optional<vector<float>> XPlaneUdp::getDatarefArray (const int32_t id) {
-    shared_lock<shared_mutex> lock{datarefMutex};
-    const auto it = dataref.left.find(id);
-    if (it == dataref.left.end())
-        return nullopt;
-    lock.unlock();
-    return getDatarefArray(it->second);
+bool XPlaneUdp::getDataref (const DatarefIndex &dataref, float &value, const float defaultValue) const {
+    if (!dataRefs[dataref.idx].available) {
+        value = defaultValue;
+        return false;
+    }
+    value = values[dataref.idx];
+    return true;
 }
 
 /**
- * @brief 设置某组 dataref 值
- * @param dataRef dataref 名称
- * @param container 存放数据的容器
+ * @brief 修改获取 dataref 的频率
+ * @param dataref 标识
+ * @param freq 频率
  */
-void XPlaneUdp::setDatarefArray (const std::string &dataRef, const std::vector<float> &container) {
-    array<char, 509> buffer{};
-    for (int i = 0; i < container.size(); ++i) {
-        pack(buffer, 0, DATAREF_SET_HEAD, container[i], dataRef + '[' + to_string(i) + ']', '\x00');
-        sendUdpData(buffer);
+void XPlaneUdp::changeDatarefFreq (const DatarefIndex &dataref, const float freq) {
+    auto &ref = dataRefs[dataref.idx];
+    const int size = ref.end - ref.start + 1;
+    if (freq == 0) { // 停止接收
+        if (!ref.available)
+            return;
+        ref.available = false;
+        space.set(ref.start, size, false);
+    } else {
+        // 先恢复
+        if (!ref.available) {
+            ref.available = true;
+            const int start = static_cast<int>(findSpace(size));
+            ref.start = start;
+            ref.end = start + size - 1;
+        }
+        // 再发送
+        std::vector<char> buffer(413);
+        if (!ref.isArray) {
+            pack(buffer, 0, DATAREF_GET_HEAD, freq, ref.start, ref.name);
+            sendData(std::move(buffer));
+        } else {
+            for (size_t i = 0; i < size; ++i) {
+                pack(buffer, 0, DATAREF_GET_HEAD, freq, ref.start + i, std::format("{}[{}]", ref.name, i));
+                sendData(buffer);
+            }
+        }
     }
 }
 
 /**
- * @brief 通过 dataref 名称索引唯一 id
- * @param dataRef dataref 名称
- * @return 唯一 id
+ * @brief 设置dataref值
+ * @param dataref dataref 名称
+ * @param value 值
+ * @param index 目标为数组时的索引
  */
-optional<int32_t> XPlaneUdp::datarefArrayName2Id (const std::string &dataRef) {
-    return datarefName2Id(dataRef);
+void XPlaneUdp::setDataref (const std::string &dataref, const float value, int index) {
+    std::vector<char> buffer(509);
+    const std::string name = (index == -1) ? dataref : std::format("{}[{}]", dataref, index);
+    pack(buffer, 0, DATAREF_SET_HEAD, value, name, '\x00');
+    sendData(std::move(buffer));
 }
 
 /**
  * @brief 开始接收基本信息
  * @param freq 接收频率
  */
-void XPlaneUdp::addBasicInfo (const int32_t freq) {
-    const string sentence = BASIC_INFO_HEAD + to_string(freq) + '\x00';
-    vector<char> buffer(sentence.size());
+void XPlaneUdp::addPlaneInfo (int freq) {
+    const std::string sentence = std::format("{}{}\x00", BASIC_INFO_HEAD, freq);
+    std::vector<char> buffer(sentence.size());
     pack(buffer, 0, sentence);
-    sendUdpData(move(buffer));
+    sendData(std::move(buffer));
 }
 
 /**
  * @brief 获取基本信息最新值
- * @return 基本信息
  */
-optional<PlaneInfo> XPlaneUdp::getBasicInfo () {
-    if (!receivedInfo)
-        return nullopt;
-    unique_lock<mutex> lock(latestBasicInfoMutex);
-    return latestBasicInfo;
+void XPlaneUdp::getPlaneInfo (PlaneInfo &infoDst) const {
+    infoDst = info;
 }
 
 /**
- * @brief 获取某个 dataref 最新值
- * @param dataRef dataref 名称
- * @param index 目标为数组时的索引
- * @return 最新值
+ * @brief 监听XPlane是否在线
  */
-optional<float> XPlaneUdp::getDataref (const std::string &dataRef, const int index) {
-    if (const auto datarefIndex = datarefName2Id(dataRef, index); datarefIndex.has_value())
-        return getDataref(datarefIndex.value());
-    return nullopt;
+void XPlaneUdp::detect () {
+    // 绑定到多播
+    multicastSocket.open(ip::udp::v4());
+    const asio::socket_base::reuse_address option(true);
+    multicastSocket.set_option(option);
+    ip::udp::endpoint multicastEndpoint;
+    if (IS_WIN)
+        multicastEndpoint = ip::udp::endpoint(ip::udp::v4(), MULTI_CAST_PORT);
+    else
+        multicastEndpoint = ip::udp::endpoint(ip::make_address(MULTI_CAST_GROUP), MULTI_CAST_PORT);
+    multicastSocket.bind(multicastEndpoint);
+    const ip::address_v4 multicast_address = ip::make_address_v4(MULTI_CAST_GROUP);
+    multicastSocket.set_option(ip::multicast::join_group(multicast_address));
 }
 
 /**
- * @brief 获取某个 dataref 最新值
- * @param id dataref 索引
- * @return 最新值
+ * @brief 找到一段连续可用的空间
+ * @param length 长度
+ * @return 初始位置
  */
-optional<float> XPlaneUdp::getDataref (const int32_t id) {
-    unique_lock<mutex> lock{latestDatarefMutex};
-    const auto it = latestDataref.find(id);
-    if (it == latestDataref.end())
-        return nullopt;
-    return it->second;
+size_t XPlaneUdp::findSpace (const size_t length) {
+    size_t start{}, count{};
+    for (size_t i = 0; i < space.size(); ++i) {
+        if (!space[i]) {
+            if (count == 0)
+                start = i;
+            ++count;
+            if (count >= length) {
+                space.set(start, start + length, true);
+                extendSpace();
+                return start;
+            }
+        } else {
+            count = 0;
+        }
+    }
+    // 补充
+    for (int i = 0; i < length; ++i)
+        space.push_back(true);
+    extendSpace();
+    return space.size() - length;
+}
+
+void XPlaneUdp::extendSpace () {
+    for (int i = 0; i < (space.size() - values.size()); ++i)
+        values.emplace_back();
 }
 
 /**
- * @brief 通过 dataref 名称索引唯一 id
- * @param dataRef dataref 名称
- * @param index 目标为数组时的索引
- * @return 唯一 id
+ * @brief 向xp发送udp数据
+ * @param data 数据
  */
-optional<int32_t> XPlaneUdp::datarefName2Id (const std::string &dataRef, const int index) {
-    const string combineName{(index != -1) ? (dataRef + '[' + to_string(index) + ']') : dataRef};
-    shared_lock<shared_mutex> lock{datarefMutex};
-    const auto it = dataref.right.find(combineName);
-    if (it == dataref.right.end())
-        return nullopt;
-    return it->get_left();
+void XPlaneUdp::sendData (std::vector<char> data) {
+    asio::co_spawn(io_context, send(std::move(data)), asio::detached);
+}
+
+asio::awaitable<void> XPlaneUdp::send (std::vector<char> &&data) {
+    const auto buffer = std::make_shared<std::vector<char>>(std::move(data));
+    co_await xpSocket.async_send_to(asio::buffer(*buffer), xpEndpoint, asio::use_awaitable);
+}
+
+/**
+ * @brief 接收数据
+ */
+void XPlaneUdp::receiveData () {
+    asio::co_spawn(io_context, receive(), asio::detached);
+}
+
+asio::awaitable<void> XPlaneUdp::receive () {
+    ip::udp::endpoint xpSend;
+    std::array<char, 1472> receiveBuffer{};
+    while (xpSocket.is_open()) {
+        // 这里非常非常怪 应该是 std::tuple<boost::system::error_code, unsigned long long>
+        size_t bytes_received = co_await xpSocket.async_receive_from(
+            asio::buffer(receiveBuffer), xpSend, asio::use_awaitable);
+        receiveDataProcess({receiveBuffer.begin(), receiveBuffer.begin() + bytes_received});
+    }
+}
+
+void XPlaneUdp::receiveDataProcess (std::vector<char> data) {
+    if (equal(DATAREF_GET_HEAD.begin(), DATAREF_GET_HEAD.begin() + 4, data.begin())) { // dataref,文档有误实际返回 RREF,
+        if ((data.size() - 5) % 8 != 0)
+            return;
+        for (int i = HEADER_LENGTH; i < data.size(); i += 8) {
+            int index;
+            float value;
+            unpack(data, i, index, value);
+            values[index] = value;
+        }
+    } else if (equal(BASIC_INFO_HEAD.begin(), BASIC_INFO_HEAD.begin() + 4, data.begin())) { // 基本信息
+        if (((data.size() - 5) % 64 != 0) || (data.size() <= 6))
+            return;
+        unpack(data, HEADER_LENGTH, info);
+    }
 }
