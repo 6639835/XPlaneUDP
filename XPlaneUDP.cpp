@@ -55,9 +55,9 @@ void XPlaneUdp::reconnect () {
         for (int i = start; i <= end; ++i) {
             std::vector<char> buffer(413);
             if (isArray)
-                pack(buffer, 0, DATAREF_GET_HEAD, freq, i, name);
+                pack(buffer, 0, DATAREF_GET_HEAD, freq, i, std::format("{}[{}]", name, i - start));
             else
-                pack(buffer, 0, DATAREF_GET_HEAD, freq, i, std::format("{}[{}]", name, i));
+                pack(buffer, 0, DATAREF_GET_HEAD, freq, i, name);
             sendData(buffer);
         }
     }
