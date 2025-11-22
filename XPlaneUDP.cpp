@@ -244,7 +244,7 @@ void XPlaneUdp::setState (const bool newState) {
     if (newState == state)
         return;
     if (newState && autoReconnect)
-        reconnect(TODO);
+        reconnect();
     state = newState;
     if (callback)
         callback(newState);
