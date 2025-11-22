@@ -1,6 +1,6 @@
 XPlane UDP
 ===============================
-支持与 XPlane 通信
+与 XPlane 通信
 
 测试通过环境：Win11(64)、XPlane12、C++20、Boost1.89、MinGW13.1
 
