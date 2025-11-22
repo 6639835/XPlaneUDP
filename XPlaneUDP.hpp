@@ -7,6 +7,9 @@
 #include <format>
 #include <iostream>
 #include <ranges>
+#include <memory>
+#include <array>
+#include <boost/pool/pool_alloc.hpp>
 
 
 template <typename T>
@@ -15,7 +18,6 @@ concept Container = std::ranges::random_access_range<T> &&
         std::is_assignable_v<std::ranges::range_reference_t<T>, float> && requires(T contain) {
             contain.size();
         } ;
-
 template <typename T>
 concept CharContainer = requires(T contain) {
     requires std::same_as<typename T::value_type, char>;
@@ -33,11 +35,30 @@ namespace asio = boost::asio;
 namespace ip = asio::ip;
 
 class XPlaneUdp;
+class BufferPool;
 
 template <typename T, typename... Rests>
     requires (std::same_as<std::string, T> || std::is_fundamental_v<T>)
-size_t pack (std::vector<char> &container, size_t offset, const T &first, const Rests &... rest);
+size_t packSize (size_t offset, const T &first, const Rests &... rest);
+template <typename T1, typename T2, typename... Rests>
+    requires (std::same_as<std::string, T2> || std::is_fundamental_v<T2>)
+size_t pack (T1 &container, size_t offset, const T2 &first, const Rests &... rest);
 
+
+class BufferPool {
+    struct BufferPro {
+        std::array<char, 1472> data{};
+        size_t length;
+        BufferPro () : length(0) { std::memset(data.data(), 0x00, data.size()); }
+    };
+    using PoolAllocator = boost::pool_allocator<BufferPro>;
+    public:
+        BufferPool () = default;
+        [[nodiscard]] std::shared_ptr<std::array<char, 1472>> getBuffer (size_t length) const;
+    private:
+        PoolAllocator allocator_;
+        void recycleBuffer (BufferPro *buffer) const;
+};
 
 class XPlaneUdp {
     public:
@@ -58,7 +79,8 @@ class XPlaneUdp {
         XPlaneUdp& operator= (XPlaneUdp &&) = delete;
 
         void setCallback (const std::function<void  (bool)> &callbackFunc);
-        void reconnect ();
+        void reconnect (bool del=false);
+        void close();
 
         DatarefIndex addDataref (const std::string &dataref, int32_t freq = 1, int index = -1);
         DatarefIndex addDatarefArray (const std::string &dataref, int length, int32_t freq = 1);
@@ -87,6 +109,7 @@ class XPlaneUdp {
         boost::dynamic_bitset<> space;
         std::unordered_map<std::string, size_t> exist;
         PlaneInfo info{.track = -1};
+        BufferPool pool{};
         // 网络
         bool autoReconnect; // 自动重连
         asio::io_context io_context{}; // 上下文
@@ -105,11 +128,12 @@ class XPlaneUdp {
         void extendSpace ();
         void detectBeacon ();
         asio::awaitable<void> detect ();
-        void sendData (std::vector<char> data);
-        asio::awaitable<void> send (std::shared_ptr<std::vector<char>> data);
+        void sendData (const std::shared_ptr<std::array<char, 1472>> &data, size_t size);
+        asio::awaitable<void> send (std::shared_ptr<std::array<char, 1472>> data, size_t size);
         void receiveData ();
         asio::awaitable<void> receive ();
-        void receiveDataProcess (std::vector<char> data, const ip::udp::endpoint &sender);
+        void receiveDataProcess (const std::shared_ptr<std::array<char, 1472>> &data, size_t size,
+                                 const ip::udp::endpoint &sender);
 };
 
 /**
@@ -124,6 +148,29 @@ void unpack (const CharContainer &container, size_t offset, First &first, Rests 
         unpack(container, offset + sizeof(First), rest...);
 }
 
+
+/**
+ * @brief 打包字符数量
+ * @param offset 偏移量
+ * @param first string,基本类型
+ * @return 打包数据量
+ */
+template <typename T, typename... Rests>
+    requires (std::same_as<std::string, T> || std::is_fundamental_v<T>)
+size_t packSize (const size_t offset, const T &first, const Rests &... rest) {
+    if constexpr (std::same_as<std::string, T>) { // string
+        if constexpr (sizeof...(rest) > 0)
+            return packSize(offset + first.size(), rest...);
+        else
+            return offset + first.size();
+    } else { // 基本类型
+        if constexpr (sizeof...(rest) > 0)
+            return packSize(offset + sizeof(T), rest...);
+        else
+            return offset + sizeof(T);
+    }
+}
+
 /**
  * @brief 打包为字符数组
  * @param container 容器
@@ -131,21 +178,21 @@ void unpack (const CharContainer &container, size_t offset, First &first, Rests 
  * @param first string,基本类型
  * @return 打包数据量
  */
-template <typename T, typename... Rests>
-    requires (std::same_as<std::string, T> || std::is_fundamental_v<T>)
-size_t pack (std::vector<char> &container, const size_t offset, const T &first, const Rests &... rest) {
-    if constexpr (std::same_as<std::string, T>) { // string
+template <typename T1, typename T2, typename... Rests>
+    requires (std::same_as<std::string, T2> || std::is_fundamental_v<T2>)
+size_t pack (T1 &container, const size_t offset, const T2 &first, const Rests &... rest) {
+    if constexpr (std::same_as<std::string, T2>) { // string
         memcpy(container.data() + offset, first.data(), first.size());
         if constexpr (sizeof...(rest) > 0)
             return pack(container, offset + first.size(), rest...);
         else
             return offset + first.size();
     } else { // 基本类型
-        memcpy(container.data() + offset, &first, sizeof(T));
+        memcpy(container.data() + offset, &first, sizeof(T2));
         if constexpr (sizeof...(rest) > 0)
-            return pack(container, offset + sizeof(T), rest...);
+            return pack(container, offset + sizeof(T2), rest...);
         else
-            return offset + sizeof(T);
+            return offset + sizeof(T2);
     }
 }
 
@@ -176,10 +223,11 @@ bool XPlaneUdp::getDataref (const DatarefIndex &dataref, T &container, float def
  */
 template <Container T>
 void XPlaneUdp::setDatarefArray (const std::string &dataref, const T &value) {
-    std::vector<char> buffer(509);
     for (int i = 0; i < value.size(); ++i) {
-        pack(buffer, 0, DATAREF_SET_HEAD, value[i], std::format("{}[{}]", dataref, i), '\x00');
-        sendData(buffer);
+        const size_t bufferSize = packSize(0, DATAREF_SET_HEAD, value[i], std::format("{}[{}]", dataref, i), '\x00');
+        const auto buffer = pool.getBuffer(bufferSize);
+        pack(*buffer, 0, DATAREF_SET_HEAD, value[i], std::format("{}[{}]", dataref, i), '\x00');
+        sendData(buffer, 509);
     }
 }
 

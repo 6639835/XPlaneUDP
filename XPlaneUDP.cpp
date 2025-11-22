@@ -10,6 +10,31 @@ static constexpr std::string MULTI_CAST_GROUP{"239.255.1.1"};
 static constexpr unsigned short MULTI_CAST_PORT{49707};
 
 
+/**
+ * @brief 获取一个 array<char, 1472>
+ * @param length 会使用的长度
+ * @return 智能指针包含的数组
+ */
+std::shared_ptr<std::array<char, 1472>> BufferPool::getBuffer (const size_t length) const {
+    BufferPro *buffer = allocator_.allocate(1);
+    new(buffer) BufferPro();
+    buffer->length = length;
+    std::memset(buffer->data.data(), 0x00, buffer->data.size());
+    auto deleter = [this](std::array<char, 1472> *ptr) {
+        BufferPro *buffer_ = reinterpret_cast<BufferPro*>(ptr);
+        this->recycleBuffer(buffer_);
+    };
+    return std::shared_ptr<std::array<char, 1472>>(&buffer->data, deleter);
+}
+
+void BufferPool::recycleBuffer (BufferPro *buffer) const {
+    if (buffer) {
+        std::memset(buffer->data.data(), 0x00, buffer->length);
+        buffer->~BufferPro();
+        allocator_.deallocate(buffer, 1);
+    }
+}
+
 XPlaneUdp::XPlaneUdp (const bool autoReConnect) : autoReconnect(autoReConnect),
                                                   workGuard(asio::make_work_guard(io_context)),
                                                   worker([this] () { io_context.run(); }) {
@@ -47,25 +72,33 @@ void XPlaneUdp::setCallback (const std::function<void  (bool)> &callbackFunc) {
 /**
  * @brief 重连
  */
-void XPlaneUdp::reconnect () {
+void XPlaneUdp::reconnect (const bool del) {
     // dataref
-    for (const auto &[name, start, end, freq, available, isArray] : dataRefs) {
+    for (auto &[name, start, end, freq, available, isArray] : dataRefs) {
         if (!available)
             continue;
         for (int i = start; i <= end; ++i) {
-            std::vector<char> buffer(413);
-            if (isArray)
-                pack(buffer, 0, DATAREF_GET_HEAD, freq, i, std::format("{}[{}]", name, i - start));
-            else
-                pack(buffer, 0, DATAREF_GET_HEAD, freq, i, name);
-            sendData(buffer);
+            std::string combine = isArray ? std::format("{}[{}]", name, i - start) : name;
+            const size_t size = packSize(0, DATAREF_GET_HEAD, del ? 0 : freq, i, combine);
+            auto buffer = pool.getBuffer(size);
+            pack(*buffer, 0, DATAREF_GET_HEAD, freq, i, combine);
+            sendData(buffer, 413);
         }
     }
     // 信息
-    const std::string sentence = std::format("{}{}\x00", BASIC_INFO_HEAD, infoFreq);
-    std::vector<char> buffer(sentence.size());
-    pack(buffer, 0, sentence);
-    sendData(std::move(buffer));
+    if (infoFreq == 0)
+        return;
+    const std::string sentence = std::format("{}{}\x00", BASIC_INFO_HEAD, del ? 0 : infoFreq);
+    const auto buffer2 = pool.getBuffer(sentence.size());
+    pack(*buffer2, 0, sentence);
+    sendData(buffer2, sentence.size());
+}
+
+/**
+ * @brief 关闭所有 UDP 接收
+ */
+void XPlaneUdp::close () {
+    reconnect(true);
 }
 
 /**
@@ -82,9 +115,10 @@ XPlaneUdp::DatarefIndex XPlaneUdp::addDataref (const std::string &dataref, int32
     }
     size_t start = findSpace(1);
     dataRefs.emplace_back(name, start, start, freq, true, false);
-    std::vector<char> buffer(413);
-    pack(buffer, 0, DATAREF_GET_HEAD, freq, start, name);
-    sendData(std::move(buffer));
+    const size_t size = packSize(0, DATAREF_GET_HEAD, freq, start, name);
+    const auto buffer = pool.getBuffer(size);
+    pack(*buffer, 0, DATAREF_GET_HEAD, freq, start, name);
+    sendData(buffer, 413);
     exist[name] = dataRefs.size() - 1;
     return {dataRefs.size() - 1};
 }
@@ -104,9 +138,10 @@ XPlaneUdp::DatarefIndex XPlaneUdp::addDatarefArray (const std::string &dataref, 
     dataRefs.emplace_back(dataref, start, start + length - 1, freq, true, true);
     for (int i = 0; i < length; ++i) {
         std::string name = std::format("{}[{}]", dataref, i);
-        std::vector<char> buffer(413);
-        pack(buffer, 0, DATAREF_GET_HEAD, freq, start + i, name);
-        sendData(std::move(buffer));
+        const size_t size{packSize(0, DATAREF_GET_HEAD, freq, start + i, name)};
+        auto buffer = pool.getBuffer(size);
+        pack(*buffer, 0, DATAREF_GET_HEAD, freq, start + i, name);
+        sendData(buffer, 413);
     }
     exist[dataref] = dataRefs.size() - 1;
     return {dataRefs.size() - 1};
@@ -150,14 +185,18 @@ void XPlaneUdp::changeDatarefFreq (const DatarefIndex &dataref, const float freq
             ref.end = start + size - 1;
         }
         // 再发送
-        std::vector<char> buffer(413);
         if (!ref.isArray) {
-            pack(buffer, 0, DATAREF_GET_HEAD, freq, ref.start, ref.name);
-            sendData(std::move(buffer));
+            const size_t bufferSize = packSize(0, DATAREF_GET_HEAD, freq, ref.start, ref.name);
+            const auto buffer = pool.getBuffer(bufferSize);
+            pack(*buffer, 0, DATAREF_GET_HEAD, freq, ref.start, ref.name);
+            sendData(buffer, 413);
         } else {
             for (size_t i = 0; i < size; ++i) {
-                pack(buffer, 0, DATAREF_GET_HEAD, freq, ref.start + i, std::format("{}[{}]", ref.name, i));
-                sendData(buffer);
+                const size_t bufferSize = packSize(0, DATAREF_GET_HEAD, freq, ref.start,
+                                                   std::format("{}[{}]", ref.name, i));
+                const auto buffer = pool.getBuffer(bufferSize);
+                pack(*buffer, 0, DATAREF_GET_HEAD, freq, ref.start + i, std::format("{}[{}]", ref.name, i));
+                sendData(buffer, 413);
             }
         }
     }
@@ -170,10 +209,11 @@ void XPlaneUdp::changeDatarefFreq (const DatarefIndex &dataref, const float freq
  * @param index 目标为数组时的索引
  */
 void XPlaneUdp::setDataref (const std::string &dataref, const float value, int index) {
-    std::vector<char> buffer(509);
     const std::string name = (index == -1) ? dataref : std::format("{}[{}]", dataref, index);
-    pack(buffer, 0, DATAREF_SET_HEAD, value, name, '\x00');
-    sendData(std::move(buffer));
+    const size_t bufferSize = packSize(0, DATAREF_SET_HEAD, value, name, '\x00');
+    const auto buffer = pool.getBuffer(bufferSize);
+    pack(*buffer, 0, DATAREF_SET_HEAD, value, name, '\x00');
+    sendData(buffer, 509);
 }
 
 /**
@@ -183,9 +223,10 @@ void XPlaneUdp::setDataref (const std::string &dataref, const float value, int i
 void XPlaneUdp::addPlaneInfo (int freq) {
     infoFreq = freq;
     const std::string sentence = std::format("{}{}\x00", BASIC_INFO_HEAD, freq);
-    std::vector<char> buffer(sentence.size());
-    pack(buffer, 0, sentence);
-    sendData(std::move(buffer));
+    const size_t bufferSize = packSize(0, sentence);
+    const auto buffer = pool.getBuffer(bufferSize);
+    pack(*buffer, 0, sentence);
+    sendData(buffer, bufferSize);
 }
 
 /**
@@ -203,7 +244,7 @@ void XPlaneUdp::setState (const bool newState) {
     if (newState == state)
         return;
     if (newState && autoReconnect)
-        reconnect();
+        reconnect(TODO);
     state = newState;
     if (callback)
         callback(newState);
@@ -250,15 +291,15 @@ void XPlaneUdp::detectBeacon () {
 }
 
 asio::awaitable<void> XPlaneUdp::detect () {
-    std::array<char, 1024> receiveBuffer{};
     ip::udp::endpoint senderEndpoint;
     asio::steady_timer timer(co_await asio::this_coro::executor);
     while (true) {
+        auto buffer = pool.getBuffer(0);
         timer.expires_after(std::chrono::seconds(2));
         timer.async_wait([this](const auto &ec) { if (!ec)setState(false); });
-        size_t bytes_received = co_await multicastSocket.async_receive_from(
-            asio::buffer(receiveBuffer), senderEndpoint, asio::use_awaitable);
-        receiveDataProcess({receiveBuffer.begin(), receiveBuffer.begin() + bytes_received}, senderEndpoint);
+        size_t receiveBytes = co_await multicastSocket.async_receive_from(
+            asio::buffer(*buffer), senderEndpoint, asio::use_awaitable);
+        receiveDataProcess(buffer, receiveBytes, senderEndpoint);
         timer.cancel();
     }
 }
@@ -266,17 +307,19 @@ asio::awaitable<void> XPlaneUdp::detect () {
 /**
  * @brief 向xp发送udp数据
  * @param data 数据
+ * @param size
  */
-void XPlaneUdp::sendData (std::vector<char> data) {
+void XPlaneUdp::sendData (const std::shared_ptr<std::array<char, 1472>> &data, const size_t size) {
     if (!xpSocket.is_open())
         return;
-    const auto buffer = std::make_shared<std::vector<char>>(std::move(data));
-    asio::co_spawn(io_context, send(buffer), asio::detached);
+    asio::co_spawn(io_context, send(data, size), asio::detached);
 }
 
-asio::awaitable<void> XPlaneUdp::send (const std::shared_ptr<std::vector<char>> data) {
-    co_await xpSocket.async_send_to(asio::buffer(*data), xpEndpoint, asio::use_awaitable);
+asio::awaitable<void> XPlaneUdp::send (const std::shared_ptr<std::array<char, 1472>> data, const size_t size) {
+    // 协程 多么好的一件美事啊，sendData执行完代码就退出了，留着send慢慢等待调度发送
+    co_await xpSocket.async_send_to(asio::buffer(*data, size), xpEndpoint, asio::use_awaitable);
 }
+
 
 /**
  * @brief 接收数据
@@ -287,36 +330,36 @@ void XPlaneUdp::receiveData () {
 
 asio::awaitable<void> XPlaneUdp::receive () {
     ip::udp::endpoint temp;
-    std::array<char, 1472> receiveBuffer{};
     while (xpSocket.is_open()) {
-        // 这里非常非常怪 提示 std::tuple<boost::system::error_code, unsigned long long>
-        size_t bytes_received = co_await xpSocket.async_receive_from(
-            asio::buffer(receiveBuffer), temp, asio::use_awaitable);
-        receiveDataProcess({receiveBuffer.begin(), receiveBuffer.begin() + bytes_received}, temp);
+        auto buffer = pool.getBuffer(0);
+        size_t receiveBytes = co_await xpSocket.async_receive_from(
+            asio::buffer(*buffer), temp, asio::use_awaitable);
+        receiveDataProcess(buffer, receiveBytes, temp);
     }
 }
 
-void XPlaneUdp::receiveDataProcess (std::vector<char> data, const ip::udp::endpoint &sender) {
-    if (std::ranges::equal(DATAREF_GET_HEAD | std::views::take(4), data | std::views::take(4))) { // dataref
-        if ((data.size() - 5) % 8 != 0)
+void XPlaneUdp::receiveDataProcess (const std::shared_ptr<std::array<char, 1472>> &data, const size_t size,
+                                    const ip::udp::endpoint &sender) {
+    if (std::ranges::equal(DATAREF_GET_HEAD | std::views::take(4), *data | std::views::take(4))) { // dataref
+        if ((size - 5) % 8 != 0)
             return;
-        for (int i = HEADER_LENGTH; i < data.size(); i += 8) {
+        for (int i = HEADER_LENGTH; i < size; i += 8) {
             int index;
             float value;
-            unpack(data, i, index, value);
+            unpack(*data, i, index, value);
             values[index] = value;
         }
-    } else if (std::ranges::equal(BASIC_INFO_HEAD | std::views::take(4), data | std::views::take(4))) { // 基本信息
-        if (((data.size() - 5) % 64 != 0) || (data.size() <= 6))
+    } else if (std::ranges::equal(BASIC_INFO_HEAD | std::views::take(4), *data | std::views::take(4))) { // 基本信息
+        if (((size - 5) % 64 != 0) || (size <= 6))
             return;
-        unpack(data, HEADER_LENGTH, info);
-    } else if (std::ranges::equal(BECON_HEAD | std::views::take(4), data | std::views::take(4))) { // 信标
+        unpack(*data, HEADER_LENGTH, info);
+    } else if (std::ranges::equal(BECON_HEAD | std::views::take(4), *data | std::views::take(4))) { // 信标
         if (!xpSocket.is_open()) { // 第一次听见信标
             uint8_t mainVer, minorVer;
             int32_t software, xpVer;
             uint32_t role;
             uint16_t port;
-            unpack(data, 5, mainVer, minorVer, software, xpVer, role, port);
+            unpack(*data, 5, mainVer, minorVer, software, xpVer, role, port);
             xpEndpoint = ip::udp::endpoint(ip::make_address(sender.address().to_string()), port);
             const ip::udp::endpoint local(ip::udp::v4(), 0);
             xpSocket.open(local.protocol());
@@ -325,4 +368,6 @@ void XPlaneUdp::receiveDataProcess (std::vector<char> data, const ip::udp::endpo
         }
         setState(true);
     }
+    // 手动擦除数据
+    std::memset(data->data(), 0x00, size);
 }

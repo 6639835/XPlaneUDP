@@ -32,7 +32,7 @@ int main () {
         cout << timeValue << " " << info.lon << endl;
         // 写入数据
         rev = !rev;
-        xp.setDataref(set, rev ? 12640 : 12665);
+        xp.setDataref(set, rev ? 12540 : 12665);
     }
     return 0;
 }
