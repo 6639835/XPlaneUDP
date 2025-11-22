@@ -16,7 +16,7 @@ static constexpr unsigned short MULTI_CAST_PORT{49707};
  * @return 智能指针包含的数组
  */
 std::shared_ptr<std::array<char, 1472>> BufferPool::getBuffer (const size_t length) const {
-    BufferPro *buffer = allocator_.allocate(1);
+    BufferPro *buffer = allocator.allocate(1);
     new(buffer) BufferPro();
     buffer->length = length;
     std::memset(buffer->data.data(), 0x00, buffer->data.size());
@@ -24,14 +24,14 @@ std::shared_ptr<std::array<char, 1472>> BufferPool::getBuffer (const size_t leng
         BufferPro *buffer_ = reinterpret_cast<BufferPro*>(ptr);
         this->recycleBuffer(buffer_);
     };
-    return std::shared_ptr<std::array<char, 1472>>(&buffer->data, deleter);
+    return {&buffer->data, deleter};
 }
 
 void BufferPool::recycleBuffer (BufferPro *buffer) const {
     if (buffer) {
         std::memset(buffer->data.data(), 0x00, buffer->length);
         buffer->~BufferPro();
-        allocator_.deallocate(buffer, 1);
+        allocator.deallocate(buffer, 1);
     }
 }
 
@@ -55,6 +55,8 @@ XPlaneUdp::XPlaneUdp (const bool autoReConnect) : autoReconnect(autoReConnect),
 
 XPlaneUdp::~XPlaneUdp () {
     workGuard.reset();
+    xpSocket.close();
+    multicastSocket.close();
     io_context.stop();
     if (worker.joinable()) {
         worker.join();

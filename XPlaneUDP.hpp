@@ -51,12 +51,11 @@ class BufferPool {
         size_t length;
         BufferPro () : length(0) { std::memset(data.data(), 0x00, data.size()); }
     };
-    using PoolAllocator = boost::pool_allocator<BufferPro>;
     public:
         BufferPool () = default;
         [[nodiscard]] std::shared_ptr<std::array<char, 1472>> getBuffer (size_t length) const;
     private:
-        PoolAllocator allocator_;
+        boost::pool_allocator<BufferPro> allocator;
         void recycleBuffer (BufferPro *buffer) const;
 };
 
