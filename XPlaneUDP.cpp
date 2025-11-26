@@ -322,7 +322,6 @@ asio::awaitable<void> XPlaneUdp::send (const std::shared_ptr<std::array<char, 14
     co_await xpSocket.async_send_to(asio::buffer(*data, size), xpEndpoint, asio::use_awaitable);
 }
 
-
 /**
  * @brief 接收数据
  */
@@ -340,9 +339,15 @@ asio::awaitable<void> XPlaneUdp::receive () {
     }
 }
 
+bool compareHead (const std::string &templateHead, const std::array<char, 1472> &data) {
+    return std::ranges::equal(templateHead | std::views::take(4), data | std::views::take(4));
+}
+
 void XPlaneUdp::receiveDataProcess (const std::shared_ptr<std::array<char, 1472>> &data, const size_t size,
                                     const ip::udp::endpoint &sender) {
-    if (std::ranges::equal(DATAREF_GET_HEAD | std::views::take(4), *data | std::views::take(4))) { // dataref
+    if (size <= HEADER_LENGTH) // 头部大小
+        return;
+    if (compareHead(DATAREF_GET_HEAD, *data)) { // dataref
         if ((size - 5) % 8 != 0)
             return;
         for (int i = HEADER_LENGTH; i < size; i += 8) {
@@ -351,17 +356,17 @@ void XPlaneUdp::receiveDataProcess (const std::shared_ptr<std::array<char, 1472>
             unpack(*data, i, index, value);
             values[index] = value;
         }
-    } else if (std::ranges::equal(BASIC_INFO_HEAD | std::views::take(4), *data | std::views::take(4))) { // 基本信息
+    } else if (compareHead(BASIC_INFO_HEAD, *data)) { // 基本信息
         if (((size - 5) % 64 != 0) || (size <= 6))
             return;
         unpack(*data, HEADER_LENGTH, info);
-    } else if (std::ranges::equal(BECON_HEAD | std::views::take(4), *data | std::views::take(4))) { // 信标
+    } else if (compareHead(BECON_HEAD, *data)) { // 信标
         if (!xpSocket.is_open()) { // 第一次听见信标
             uint8_t mainVer, minorVer;
             int32_t software, xpVer;
             uint32_t role;
             uint16_t port;
-            unpack(*data, 5, mainVer, minorVer, software, xpVer, role, port);
+            unpack(*data, HEADER_LENGTH, mainVer, minorVer, software, xpVer, role, port);
             xpEndpoint = ip::udp::endpoint(ip::make_address(sender.address().to_string()), port);
             const ip::udp::endpoint local(ip::udp::v4(), 0);
             xpSocket.open(local.protocol());
