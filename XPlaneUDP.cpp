@@ -161,6 +161,7 @@ bool XPlaneUdp::getDataref (const DatarefIndex &dataref, float &value, const flo
         value = defaultValue;
         return false;
     }
+    std::shared_lock lock(dataMutex);
     value = values[dataref.idx];
     return true;
 }
@@ -235,6 +236,7 @@ void XPlaneUdp::addPlaneInfo (int freq) {
  * @brief 获取基本信息最新值
  */
 void XPlaneUdp::getPlaneInfo (PlaneInfo &infoDst) const {
+    std::shared_lock lock(dataMutex);
     infoDst = info;
 }
 
@@ -281,6 +283,7 @@ size_t XPlaneUdp::findSpace (const size_t length) {
 }
 
 void XPlaneUdp::extendSpace () {
+    std::unique_lock lock(dataMutex);
     for (int i = 0; i < (space.size() - values.size()); ++i)
         values.emplace_back();
 }
@@ -350,6 +353,7 @@ void XPlaneUdp::receiveDataProcess (const std::shared_ptr<std::array<char, 1472>
     if (compareHead(DATAREF_GET_HEAD, *data)) { // dataref
         if ((size - 5) % 8 != 0)
             return;
+        std::unique_lock lock(dataMutex);
         for (int i = HEADER_LENGTH; i < size; i += 8) {
             int index;
             float value;
@@ -359,6 +363,7 @@ void XPlaneUdp::receiveDataProcess (const std::shared_ptr<std::array<char, 1472>
     } else if (compareHead(BASIC_INFO_HEAD, *data)) { // 基本信息
         if (((size - 5) % 64 != 0) || (size <= 6))
             return;
+        std::unique_lock lock(dataMutex);
         unpack(*data, HEADER_LENGTH, info);
     } else if (compareHead(BECON_HEAD, *data)) { // 信标
         if (!xpSocket.is_open()) { // 第一次听见信标

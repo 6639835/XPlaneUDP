@@ -9,6 +9,7 @@
 #include <ranges>
 #include <memory>
 #include <array>
+#include <shared_mutex>
 #include <boost/pool/pool_alloc.hpp>
 
 
@@ -25,10 +26,10 @@ concept CharContainer = requires(T contain) {
 };
 
 constexpr int HEADER_LENGTH{5}; // 指令头部长度 4字母+1空
-constexpr static std::string DATAREF_GET_HEAD{'R', 'R', 'E', 'F', '\x00'};
-constexpr static std::string DATAREF_SET_HEAD{'D', 'R', 'E', 'F', '\x00'};
-constexpr static std::string BASIC_INFO_HEAD{'R', 'P', 'O', 'S', '\x00'};
-constexpr static std::string BECON_HEAD{'B', 'E', 'C', 'N', '\x00'};
+const static std::string DATAREF_GET_HEAD{'R', 'R', 'E', 'F', '\x00'};
+const static std::string DATAREF_SET_HEAD{'D', 'R', 'E', 'F', '\x00'};
+const static std::string BASIC_INFO_HEAD{'R', 'P', 'O', 'S', '\x00'};
+const static std::string BECON_HEAD{'B', 'E', 'C', 'N', '\x00'};
 
 namespace sys = boost::system;
 namespace asio = boost::asio;
@@ -78,8 +79,8 @@ class XPlaneUdp {
         XPlaneUdp& operator= (XPlaneUdp &&) = delete;
 
         void setCallback (const std::function<void  (bool)> &callbackFunc);
-        void reconnect (bool del=false);
-        void close();
+        void reconnect (bool del = false);
+        void close ();
 
         DatarefIndex addDataref (const std::string &dataref, int32_t freq = 1, int index = -1);
         DatarefIndex addDatarefArray (const std::string &dataref, int length, int32_t freq = 1);
@@ -107,8 +108,9 @@ class XPlaneUdp {
         std::vector<float> values;
         boost::dynamic_bitset<> space;
         std::unordered_map<std::string, size_t> exist;
-        PlaneInfo info{.track = -1};
+        PlaneInfo info{.track = -999};
         BufferPool pool{};
+        mutable std::shared_mutex dataMutex;
         // 网络
         bool autoReconnect; // 自动重连
         asio::io_context io_context{}; // 上下文
@@ -210,6 +212,7 @@ bool XPlaneUdp::getDataref (const DatarefIndex &dataref, T &container, float def
         std::ranges::fill(container | std::views::take(size), defaultValue);
         return false;
     }
+    std::shared_lock lock(dataMutex);
     auto source = values | std::views::drop(ref.start) | std::views::take(std::min(size, container.size()));
     std::ranges::copy(source, container.begin());
     return true;
