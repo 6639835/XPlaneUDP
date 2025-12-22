@@ -162,7 +162,7 @@ bool XPlaneUdp::getDataref (const DatarefIndex &dataref, float &value, const flo
         return false;
     }
     std::shared_lock lock(dataMutex);
-    value = values[dataref.idx];
+    value = values[dataRefs[dataref.idx].start];
     return true;
 }
 

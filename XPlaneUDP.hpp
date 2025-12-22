@@ -97,7 +97,7 @@ class XPlaneUdp {
     private:
         struct DatarefInfo {
             std::string name; // dataref 长度
-            int start, end; // [start,end]
+            int start, end; // values中索引,[start,end]
             int32_t freq; // 频率
             bool available; // 是否可用
             bool isArray; // 是否是数组
