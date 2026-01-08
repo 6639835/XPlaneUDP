@@ -16,7 +16,7 @@ int main () {
     xp.getDataref(engine, n1Values);
     // 设置
     const vector<float> n1{27, 28};
-    xp.setDatarefArray("sim/flightmodel/engine/ENGN_N1_", n1);
+    xp.setDataref("sim/flightmodel/engine/ENGN_N1_", n1);
     // 回调
     xp.setCallback([](const bool state) { cerr << "state change: " << state << endl; });
     // 基本信息

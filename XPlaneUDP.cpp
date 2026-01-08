@@ -39,17 +39,20 @@ XPlaneUdp::XPlaneUdp (const bool autoReConnect) : autoReconnect(autoReConnect),
                                                   workGuard(asio::make_work_guard(io_context)),
                                                   worker([this] () { io_context.run(); }) {
     // 监听信标帧
+    // * 自身地址
     multicastSocket.open(ip::udp::v4());
     const asio::socket_base::reuse_address option(true);
     multicastSocket.set_option(option);
+    // * XPlane广播地址
     ip::udp::endpoint multicastEndpoint;
-    if (IS_WIN)
+    if constexpr (IS_WIN)
         multicastEndpoint = ip::udp::endpoint(ip::udp::v4(), MULTI_CAST_PORT);
     else
         multicastEndpoint = ip::udp::endpoint(ip::make_address(MULTI_CAST_GROUP), MULTI_CAST_PORT);
     multicastSocket.bind(multicastEndpoint);
-    const ip::address_v4 multicast_address = ip::make_address_v4(MULTI_CAST_GROUP);
-    multicastSocket.set_option(ip::multicast::join_group(multicast_address));
+    // * 加入多播组
+    const ip::address_v4 multicastAddress = ip::make_address_v4(MULTI_CAST_GROUP);
+    multicastSocket.set_option(ip::multicast::join_group(multicastAddress));
     detectBeacon();
 }
 
@@ -113,7 +116,7 @@ XPlaneUdp::DatarefIndex XPlaneUdp::addDataref (const std::string &dataref, int32
     std::string name = (index == -1) ? dataref : std::format("{}[{}]", dataref, index);
     if (const auto it = exist.find(name); it != exist.end()) {
         std::cerr << "already exist! nothing change.";
-        return {it->second};
+        return DatarefIndex{it->second};
     }
     size_t start = findSpace(1);
     dataRefs.emplace_back(name, start, start, freq, true, false);
@@ -122,7 +125,7 @@ XPlaneUdp::DatarefIndex XPlaneUdp::addDataref (const std::string &dataref, int32
     pack(*buffer, 0, DATAREF_GET_HEAD, freq, start, name);
     sendData(buffer, 413);
     exist[name] = dataRefs.size() - 1;
-    return {dataRefs.size() - 1};
+    return DatarefIndex{dataRefs.size() - 1};
 }
 
 /**
@@ -134,7 +137,7 @@ XPlaneUdp::DatarefIndex XPlaneUdp::addDataref (const std::string &dataref, int32
 XPlaneUdp::DatarefIndex XPlaneUdp::addDatarefArray (const std::string &dataref, const int length, int32_t freq) {
     if (const auto it = exist.find(dataref); it != exist.end()) {
         std::cerr << "already exist! nothing change.";
-        return {it->second};
+        return DatarefIndex{it->second};
     }
     int start = static_cast<int>(findSpace(length));
     dataRefs.emplace_back(dataref, start, start + length - 1, freq, true, true);
@@ -146,7 +149,7 @@ XPlaneUdp::DatarefIndex XPlaneUdp::addDatarefArray (const std::string &dataref, 
         sendData(buffer, 413);
     }
     exist[dataref] = dataRefs.size() - 1;
-    return {dataRefs.size() - 1};
+    return DatarefIndex{dataRefs.size() - 1};
 }
 
 /**
@@ -157,12 +160,12 @@ XPlaneUdp::DatarefIndex XPlaneUdp::addDatarefArray (const std::string &dataref, 
  * @return 值可用
  */
 bool XPlaneUdp::getDataref (const DatarefIndex &dataref, float &value, const float defaultValue) const {
-    if (!dataRefs[dataref.idx].available) {
+    if (!dataRefs[dataref.getIdx()].available) {
         value = defaultValue;
         return false;
     }
     std::shared_lock lock(dataMutex);
-    value = values[dataRefs[dataref.idx].start];
+    value = values[dataRefs[dataref.getIdx()].start];
     return true;
 }
 
@@ -172,7 +175,7 @@ bool XPlaneUdp::getDataref (const DatarefIndex &dataref, float &value, const flo
  * @param freq 频率
  */
 void XPlaneUdp::changeDatarefFreq (const DatarefIndex &dataref, const float freq) {
-    auto &ref = dataRefs[dataref.idx];
+    auto &ref = dataRefs[dataref.getIdx()];
     const int size = ref.end - ref.start + 1;
     if (freq == 0) { // 停止接收
         if (!ref.available)

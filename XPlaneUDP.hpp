@@ -63,7 +63,15 @@ class BufferPool {
 class XPlaneUdp {
     public:
         struct DatarefIndex {
-            const size_t idx;
+            DatarefIndex () : idx(0) {}
+            explicit DatarefIndex (const size_t index) : idx(index) {}
+            DatarefIndex (const DatarefIndex &) = default;
+            DatarefIndex (DatarefIndex &&) = default;
+            DatarefIndex& operator= (const DatarefIndex &) = default;
+            DatarefIndex& operator= (DatarefIndex &&) = default;
+            [[nodiscard]] size_t getIdx () const { return idx; }
+            private:
+                size_t idx;
         };
         struct PlaneInfo {
             double lon, lat, alt; // 经纬度 高度
@@ -78,7 +86,7 @@ class XPlaneUdp {
         XPlaneUdp (XPlaneUdp &&) = delete;
         XPlaneUdp& operator= (XPlaneUdp &&) = delete;
 
-        void setCallback (const std::function<void  (bool)> &callbackFunc);
+        void setCallback (const std::function<void (bool)> &callbackFunc);
         void reconnect (bool del = false);
         void close ();
 
@@ -90,7 +98,7 @@ class XPlaneUdp {
         void changeDatarefFreq (const DatarefIndex &dataref, float freq);
         void setDataref (const std::string &dataref, float value, int index = -1);
         template <Container T>
-        void setDatarefArray (const std::string &dataref, const T &value);
+        void setDataref (const std::string &dataref, const T &value);
 
         void addPlaneInfo (int freq = 1);
         void getPlaneInfo (PlaneInfo &infoDst) const;
@@ -122,7 +130,7 @@ class XPlaneUdp {
         int infoFreq{}; // 基本信息频率
         // 回调
         bool state{false}; // xp状态
-        std::function<void  (bool)> callback{}; // 回调
+        std::function<void  (bool)> callback{nullptr}; // 回调
 
         void setState (bool newState);
         size_t findSpace (size_t length);
@@ -206,14 +214,22 @@ size_t pack (T1 &container, const size_t offset, const T2 &first, const Rests &.
  */
 template <Container T>
 bool XPlaneUdp::getDataref (const DatarefIndex &dataref, T &container, float defaultValue) {
-    const auto &ref = dataRefs[dataref.idx];
+    std::shared_lock lock(dataMutex);
+    const auto &ref = dataRefs[dataref.getIdx()];
     const size_t size = ref.end - ref.start + 1;
     if (!ref.available) {
         std::ranges::fill(container | std::views::take(size), defaultValue);
         return false;
     }
-    std::shared_lock lock(dataMutex);
-    auto source = values | std::views::drop(ref.start) | std::views::take(std::min(size, container.size()));
+    size_t containerCapacity; // 容器能塞多少元素
+    if constexpr (requires { container.capacity(); }) { // vector等
+        containerCapacity = container.capacity();
+    } else if constexpr (requires { container.size(); }) { // array等
+        containerCapacity = container.size();
+    } else {
+        static_assert("cant specify container size !");
+    }
+    auto source = values | std::views::drop(ref.start) | std::views::take(std::min(size, containerCapacity));
     std::ranges::copy(source, container.begin());
     return true;
 }
@@ -224,7 +240,7 @@ bool XPlaneUdp::getDataref (const DatarefIndex &dataref, T &container, float def
  * @param value 容器
  */
 template <Container T>
-void XPlaneUdp::setDatarefArray (const std::string &dataref, const T &value) {
+void XPlaneUdp::setDataref (const std::string &dataref, const T &value) {
     for (int i = 0; i < value.size(); ++i) {
         const size_t bufferSize = packSize(0, DATAREF_SET_HEAD, value[i], std::format("{}[{}]", dataref, i), '\x00');
         const auto buffer = pool.getBuffer(bufferSize);
