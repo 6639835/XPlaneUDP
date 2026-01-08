@@ -57,13 +57,7 @@ XPlaneUdp::XPlaneUdp (const bool autoReConnect) : autoReconnect(autoReConnect),
 }
 
 XPlaneUdp::~XPlaneUdp () {
-    workGuard.reset();
-    xpSocket.close();
-    multicastSocket.close();
-    io_context.stop();
-    if (worker.joinable()) {
-        worker.join();
-    }
+    close();
 }
 
 /**
@@ -100,10 +94,30 @@ void XPlaneUdp::reconnect (const bool del) {
 }
 
 /**
- * @brief 关闭所有 UDP 接收
+ * @brief 停止所有 UDP 接收
+ */
+void XPlaneUdp::stop () {
+    reconnect(true);
+}
+
+/**
+ * @brief 彻底关闭 UDP
  */
 void XPlaneUdp::close () {
     reconnect(true);
+    static bool closed = false;
+    if (closed)
+        return;
+    closed = true;
+    reconnect(true);
+    workGuard.reset();
+    if (xpSocket.is_open())
+        xpSocket.close();
+    if (multicastSocket.is_open())
+        multicastSocket.close();
+    io_context.stop();
+    if (worker.joinable())
+        worker.join();
 }
 
 /**

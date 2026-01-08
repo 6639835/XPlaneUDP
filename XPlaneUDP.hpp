@@ -88,7 +88,8 @@ class XPlaneUdp {
 
         void setCallback (const std::function<void (bool)> &callbackFunc);
         void reconnect (bool del = false);
-        void close ();
+        void stop ();
+        void close();
 
         DatarefIndex addDataref (const std::string &dataref, int32_t freq = 1, int index = -1);
         DatarefIndex addDatarefArray (const std::string &dataref, int length, int32_t freq = 1);
