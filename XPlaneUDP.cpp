@@ -15,23 +15,23 @@ static constexpr unsigned short MULTI_CAST_PORT{49707};
  * @param length 会使用的长度
  * @return 智能指针包含的数组
  */
-std::shared_ptr<std::array<char, 1472>> BufferPool::getBuffer (const size_t length) const {
-    BufferPro *buffer = allocator.allocate(1);
+std::shared_ptr<std::array<char, 1472>> BufferPool::getBuffer (const size_t length) {
+    BufferPro *buffer = boost::pool_allocator<BufferPro>::allocate(1);
     new(buffer) BufferPro();
     buffer->length = length;
     std::memset(buffer->data.data(), 0x00, buffer->data.size());
-    auto deleter = [this](std::array<char, 1472> *ptr) {
-        BufferPro *buffer_ = reinterpret_cast<BufferPro*>(ptr);
-        this->recycleBuffer(buffer_);
+    auto deleter = [](std::array<char, 1472> *ptr) {
+        auto *buffer_ = reinterpret_cast<BufferPro*>(ptr);
+        recycleBuffer(buffer_);
     };
     return {&buffer->data, deleter};
 }
 
-void BufferPool::recycleBuffer (BufferPro *buffer) const {
+void BufferPool::recycleBuffer (BufferPro *buffer) {
     if (buffer) {
         std::memset(buffer->data.data(), 0x00, buffer->length);
         buffer->~BufferPro();
-        allocator.deallocate(buffer, 1);
+        boost::pool_allocator<BufferPro>::deallocate(buffer, 1);
     }
 }
 
@@ -79,7 +79,7 @@ void XPlaneUdp::reconnect (const bool del) {
         for (int i = start; i <= end; ++i) {
             std::string combine = isArray ? std::format("{}[{}]", name, i - start) : name;
             const size_t size = packSize(0, DATAREF_GET_HEAD, del ? 0 : freq, i, combine);
-            auto buffer = pool.getBuffer(size);
+            auto buffer = BufferPool::getBuffer(size);
             pack(*buffer, 0, DATAREF_GET_HEAD, freq, i, combine);
             sendData(buffer, 413);
         }
@@ -88,7 +88,7 @@ void XPlaneUdp::reconnect (const bool del) {
     if (infoFreq == 0)
         return;
     const std::string sentence = std::format("{}{}\x00", BASIC_INFO_HEAD, del ? 0 : infoFreq);
-    const auto buffer2 = pool.getBuffer(sentence.size());
+    const auto buffer2 = BufferPool::getBuffer(sentence.size());
     pack(*buffer2, 0, sentence);
     sendData(buffer2, sentence.size());
 }
@@ -104,17 +104,17 @@ void XPlaneUdp::stop () {
  * @brief 彻底关闭 UDP
  */
 void XPlaneUdp::close () {
-    reconnect(true);
     static bool closed = false;
     if (closed)
         return;
     closed = true;
-    reconnect(true);
-    workGuard.reset();
-    if (xpSocket.is_open())
+    if (xpSocket.is_open()) {
+        xpSocket.cancel();
         xpSocket.close();
-    if (multicastSocket.is_open())
-        multicastSocket.close();
+    }
+    multicastSocket.cancel();
+    multicastSocket.close();
+    workGuard.reset();
     io_context.stop();
     if (worker.joinable())
         worker.join();
@@ -135,7 +135,7 @@ XPlaneUdp::DatarefIndex XPlaneUdp::addDataref (const std::string &dataref, int32
     size_t start = findSpace(1);
     dataRefs.emplace_back(name, start, start, freq, true, false);
     const size_t size = packSize(0, DATAREF_GET_HEAD, freq, start, name);
-    const auto buffer = pool.getBuffer(size);
+    const auto buffer = BufferPool::getBuffer(size);
     pack(*buffer, 0, DATAREF_GET_HEAD, freq, start, name);
     sendData(buffer, 413);
     exist[name] = dataRefs.size() - 1;
@@ -158,7 +158,7 @@ XPlaneUdp::DatarefIndex XPlaneUdp::addDatarefArray (const std::string &dataref, 
     for (int i = 0; i < length; ++i) {
         std::string name = std::format("{}[{}]", dataref, i);
         const size_t size{packSize(0, DATAREF_GET_HEAD, freq, start + i, name)};
-        auto buffer = pool.getBuffer(size);
+        auto buffer = BufferPool::getBuffer(size);
         pack(*buffer, 0, DATAREF_GET_HEAD, freq, start + i, name);
         sendData(buffer, 413);
     }
@@ -174,12 +174,12 @@ XPlaneUdp::DatarefIndex XPlaneUdp::addDatarefArray (const std::string &dataref, 
  * @return 值可用
  */
 bool XPlaneUdp::getDataref (const DatarefIndex &dataref, float &value, const float defaultValue) const {
-    if (!dataRefs[dataref.getIdx()].available) {
+    if (!dataRefs.at(dataref.getIdx()).available) {
         value = defaultValue;
         return false;
     }
     std::shared_lock lock(dataMutex);
-    value = values[dataRefs[dataref.getIdx()].start];
+    value = values.at(dataRefs.at(dataref.getIdx()).start);
     return true;
 }
 
@@ -189,7 +189,7 @@ bool XPlaneUdp::getDataref (const DatarefIndex &dataref, float &value, const flo
  * @param freq 频率
  */
 void XPlaneUdp::changeDatarefFreq (const DatarefIndex &dataref, const float freq) {
-    auto &ref = dataRefs[dataref.getIdx()];
+    auto &ref = dataRefs.at(dataref.getIdx());
     const int size = ref.end - ref.start + 1;
     if (freq == 0) { // 停止接收
         if (!ref.available)
@@ -207,14 +207,14 @@ void XPlaneUdp::changeDatarefFreq (const DatarefIndex &dataref, const float freq
         // 再发送
         if (!ref.isArray) {
             const size_t bufferSize = packSize(0, DATAREF_GET_HEAD, freq, ref.start, ref.name);
-            const auto buffer = pool.getBuffer(bufferSize);
+            const auto buffer = BufferPool::getBuffer(bufferSize);
             pack(*buffer, 0, DATAREF_GET_HEAD, freq, ref.start, ref.name);
             sendData(buffer, 413);
         } else {
             for (size_t i = 0; i < size; ++i) {
                 const size_t bufferSize = packSize(0, DATAREF_GET_HEAD, freq, ref.start,
                                                    std::format("{}[{}]", ref.name, i));
-                const auto buffer = pool.getBuffer(bufferSize);
+                const auto buffer = BufferPool::getBuffer(bufferSize);
                 pack(*buffer, 0, DATAREF_GET_HEAD, freq, ref.start + i, std::format("{}[{}]", ref.name, i));
                 sendData(buffer, 413);
             }
@@ -231,7 +231,7 @@ void XPlaneUdp::changeDatarefFreq (const DatarefIndex &dataref, const float freq
 void XPlaneUdp::setDataref (const std::string &dataref, const float value, int index) {
     const std::string name = (index == -1) ? dataref : std::format("{}[{}]", dataref, index);
     const size_t bufferSize = packSize(0, DATAREF_SET_HEAD, value, name, '\x00');
-    const auto buffer = pool.getBuffer(bufferSize);
+    const auto buffer = BufferPool::getBuffer(bufferSize);
     pack(*buffer, 0, DATAREF_SET_HEAD, value, name, '\x00');
     sendData(buffer, 509);
 }
@@ -244,7 +244,7 @@ void XPlaneUdp::addPlaneInfo (int freq) {
     infoFreq = freq;
     const std::string sentence = std::format("{}{}\x00", BASIC_INFO_HEAD, freq);
     const size_t bufferSize = packSize(0, sentence);
-    const auto buffer = pool.getBuffer(bufferSize);
+    const auto buffer = BufferPool::getBuffer(bufferSize);
     pack(*buffer, 0, sentence);
     sendData(buffer, bufferSize);
 }
@@ -274,35 +274,35 @@ void XPlaneUdp::setState (const bool newState) {
 /**
  * @brief 找到一段连续可用的空间
  * @param length 长度
- * @return 初始位置
+ * @return 起始位置
  */
 size_t XPlaneUdp::findSpace (const size_t length) {
-    size_t start{}, count{};
-    for (size_t i = 0; i < space.size(); ++i) {
-        if (!space[i]) {
-            if (count == 0)
-                start = i;
-            ++count;
-            if (count >= length) {
-                space.set(start, start + length, true);
-                extendSpace();
-                return start;
+    const size_t currentSize = space.size();
+    // 尝试在现有空间中寻找
+    if (currentSize >= length) {
+        size_t i = 0;
+        const size_t searchLimit = currentSize - length;
+        while (i <= searchLimit) {
+            size_t j;
+            for (j = 0; j < length; ++j) {
+                if (space.test(i + j))
+                    break;
             }
-        } else {
-            count = 0;
+            if (j == length) {
+                space.set(i, length, true);
+                return i;
+            }
+            i += j + 1;
         }
     }
-    // 补充
-    for (int i = 0; i < length; ++i)
-        space.push_back(true);
-    extendSpace();
-    return space.size() - length;
-}
-
-void XPlaneUdp::extendSpace () {
+    // 再次尝试分配一块空间
+    const size_t newStart = currentSize;
+    space.resize(currentSize + length, false);
+    space.set(newStart, length, true);
+    // 预留values
     std::unique_lock lock(dataMutex);
-    for (int i = 0; i < (space.size() - values.size()); ++i)
-        values.emplace_back();
+    values.resize(space.size());
+    return newStart;
 }
 
 /**
@@ -316,7 +316,7 @@ asio::awaitable<void> XPlaneUdp::detect () {
     ip::udp::endpoint senderEndpoint;
     asio::steady_timer timer(co_await asio::this_coro::executor);
     while (true) {
-        auto buffer = pool.getBuffer(0);
+        auto buffer = BufferPool::getBuffer(0);
         timer.expires_after(std::chrono::seconds(2));
         timer.async_wait([this](const auto &ec) { if (!ec)setState(false); });
         size_t receiveBytes = co_await multicastSocket.async_receive_from(
@@ -352,7 +352,7 @@ void XPlaneUdp::receiveData () {
 asio::awaitable<void> XPlaneUdp::receive () {
     ip::udp::endpoint temp;
     while (xpSocket.is_open()) {
-        auto buffer = pool.getBuffer(0);
+        auto buffer = BufferPool::getBuffer(0);
         size_t receiveBytes = co_await xpSocket.async_receive_from(
             asio::buffer(*buffer), temp, asio::use_awaitable);
         receiveDataProcess(buffer, receiveBytes, temp);
@@ -375,11 +375,10 @@ void XPlaneUdp::receiveDataProcess (const std::shared_ptr<std::array<char, 1472>
             int index;
             float value;
             unpack(*data, i, index, value);
-            values[index] = value;
+            // 这里访问越界,并导致了最终析构时的错误.很难想象这里会运行时无异常,导致析构时异常,并且debug/release/Qt下异常行为不同
+            values.at(index) = value;
         }
     } else if (compareHead(BASIC_INFO_HEAD, *data)) { // 基本信息
-        if (((size - 5) % 64 != 0) || (size <= 6))
-            return;
         std::unique_lock lock(dataMutex);
         unpack(*data, HEADER_LENGTH, info);
     } else if (compareHead(BECON_HEAD, *data)) { // 信标

@@ -20,9 +20,10 @@ concept Container = std::ranges::random_access_range<T> &&
             contain.size();
         } ;
 template <typename T>
-concept CharContainer = requires(T contain) {
-    requires std::same_as<typename T::value_type, char>;
-    contain.data();
+concept CharArray = requires(T contain) {
+    requires std::is_same_v<typename T::value_type, char> ||
+    std::is_same_v<typename T::value_type, std::byte> ||
+    std::is_same_v<typename T::value_type, uint8_t>;
 };
 
 constexpr int HEADER_LENGTH{5}; // 指令头部长度 4字母+1空
@@ -41,9 +42,11 @@ class BufferPool;
 template <typename T, typename... Rests>
     requires (std::same_as<std::string, T> || std::is_fundamental_v<T>)
 size_t packSize (size_t offset, const T &first, const Rests &... rest);
-template <typename T1, typename T2, typename... Rests>
+template <CharArray T1, typename T2, typename... Rests>
     requires (std::same_as<std::string, T2> || std::is_fundamental_v<T2>)
 size_t pack (T1 &container, size_t offset, const T2 &first, const Rests &... rest);
+template <CharArray CharList, typename First, typename... Rests>
+void unpack (const CharList &container, size_t offset, First &first, Rests &... rest);
 
 
 class BufferPool {
@@ -53,11 +56,10 @@ class BufferPool {
         BufferPro () : length(0) { std::memset(data.data(), 0x00, data.size()); }
     };
     public:
-        BufferPool () = default;
-        [[nodiscard]] std::shared_ptr<std::array<char, 1472>> getBuffer (size_t length) const;
+        static std::shared_ptr<std::array<char, 1472>> getBuffer (size_t length);
     private:
         boost::pool_allocator<BufferPro> allocator;
-        void recycleBuffer (BufferPro *buffer) const;
+        static void recycleBuffer (BufferPro *buffer);
 };
 
 class XPlaneUdp {
@@ -86,10 +88,10 @@ class XPlaneUdp {
         XPlaneUdp (XPlaneUdp &&) = delete;
         XPlaneUdp& operator= (XPlaneUdp &&) = delete;
 
-        void setCallback (const std::function<void (bool)> &callbackFunc);
+        void setCallback (const std::function<void  (bool)> &callbackFunc);
         void reconnect (bool del = false);
         void stop ();
-        void close();
+        void close ();
 
         DatarefIndex addDataref (const std::string &dataref, int32_t freq = 1, int index = -1);
         DatarefIndex addDatarefArray (const std::string &dataref, int length, int32_t freq = 1);
@@ -135,7 +137,6 @@ class XPlaneUdp {
 
         void setState (bool newState);
         size_t findSpace (size_t length);
-        void extendSpace ();
         void detectBeacon ();
         asio::awaitable<void> detect ();
         void sendData (const std::shared_ptr<std::array<char, 1472>> &data, size_t size);
@@ -151,8 +152,9 @@ class XPlaneUdp {
  * @param container 容器
  * @param offset 偏移字节
  */
-template <typename CharContainer, typename First, typename... Rests>
-void unpack (const CharContainer &container, size_t offset, First &first, Rests &... rest) {
+template <CharArray CharList, typename First, typename... Rests>
+void unpack (const CharList &container, size_t offset, First &first, Rests &... rest) {
+    assert(container.size() >= offset + sizeof(First) && "not enough to unpack !");
     memcpy(&first, container.data() + offset, sizeof(First));
     if constexpr (sizeof...(rest) > 0)
         unpack(container, offset + sizeof(First), rest...);
@@ -188,16 +190,18 @@ size_t packSize (const size_t offset, const T &first, const Rests &... rest) {
  * @param first string,基本类型
  * @return 打包数据量
  */
-template <typename T1, typename T2, typename... Rests>
+template <CharArray T1, typename T2, typename... Rests>
     requires (std::same_as<std::string, T2> || std::is_fundamental_v<T2>)
 size_t pack (T1 &container, const size_t offset, const T2 &first, const Rests &... rest) {
     if constexpr (std::same_as<std::string, T2>) { // string
+        assert(container.size() >= offset + first.size() && "not enough to pack !");
         memcpy(container.data() + offset, first.data(), first.size());
         if constexpr (sizeof...(rest) > 0)
             return pack(container, offset + first.size(), rest...);
         else
             return offset + first.size();
     } else { // 基本类型
+        assert(container.size() >= offset + sizeof(T2) && "not enough to pack !");
         memcpy(container.data() + offset, &first, sizeof(T2));
         if constexpr (sizeof...(rest) > 0)
             return pack(container, offset + sizeof(T2), rest...);
@@ -216,7 +220,7 @@ size_t pack (T1 &container, const size_t offset, const T2 &first, const Rests &.
 template <Container T>
 bool XPlaneUdp::getDataref (const DatarefIndex &dataref, T &container, float defaultValue) {
     std::shared_lock lock(dataMutex);
-    const auto &ref = dataRefs[dataref.getIdx()];
+    const auto &ref = dataRefs.at(dataref.getIdx());
     const size_t size = ref.end - ref.start + 1;
     if (!ref.available) {
         std::ranges::fill(container | std::views::take(size), defaultValue);
@@ -244,7 +248,7 @@ template <Container T>
 void XPlaneUdp::setDataref (const std::string &dataref, const T &value) {
     for (int i = 0; i < value.size(); ++i) {
         const size_t bufferSize = packSize(0, DATAREF_SET_HEAD, value[i], std::format("{}[{}]", dataref, i), '\x00');
-        const auto buffer = pool.getBuffer(bufferSize);
+        const auto buffer = BufferPool::getBuffer(bufferSize);
         pack(*buffer, 0, DATAREF_SET_HEAD, value[i], std::format("{}[{}]", dataref, i), '\x00');
         sendData(buffer, 509);
     }
