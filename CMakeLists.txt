@@ -10,10 +10,16 @@ add_executable(XPlaneUDP main.cpp
         XPlaneUDP.cpp
         XPlaneUDP.hpp
 )
-target_link_libraries(XPlaneUDP ${Boost_LIBRARIES} ws2_32)
+target_link_libraries(XPlaneUDP ${Boost_LIBRARIES})
+if (WIN32)
+    target_link_libraries(XPlaneUDP ws2_32)
+endif ()
 
 add_executable(performanceTest test.cpp
         XPlaneUDP.cpp
         XPlaneUDP.hpp
 )
-target_link_libraries(performanceTest ${Boost_LIBRARIES} ws2_32)
+target_link_libraries(performanceTest ${Boost_LIBRARIES})
+if (WIN32)
+    target_link_libraries(performanceTest ws2_32)
+endif ()

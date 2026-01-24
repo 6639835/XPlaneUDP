@@ -231,8 +231,6 @@ bool XPlaneUdp::getDataref (const DatarefIndex &dataref, T &container, float def
         containerCapacity = container.capacity();
     } else if constexpr (requires { container.size(); }) { // array等
         containerCapacity = container.size();
-    } else {
-        static_assert("cant specify container size !");
     }
     auto source = values | std::views::drop(ref.start) | std::views::take(std::min(size, containerCapacity));
     std::ranges::copy(source, container.begin());
