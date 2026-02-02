@@ -10,6 +10,7 @@
 #include <memory>
 #include <array>
 #include <shared_mutex>
+#include <atomic>
 #include <boost/pool/pool_alloc.hpp>
 
 
@@ -122,6 +123,7 @@ class XPlaneUdp {
         PlaneInfo info{.track = -999};
         BufferPool pool{};
         mutable std::shared_mutex dataMutex;
+        std::atomic<bool> closed{false};
         // 网络
         bool autoReconnect; // 自动重连
         asio::io_context io_context{}; // 上下文
@@ -221,18 +223,20 @@ template <Container T>
 bool XPlaneUdp::getDataref (const DatarefIndex &dataref, T &container, float defaultValue) {
     std::shared_lock lock(dataMutex);
     const auto &ref = dataRefs.at(dataref.getIdx());
-    const size_t size = ref.end - ref.start + 1;
+    const size_t datarefSize = static_cast<size_t>(ref.end - ref.start + 1);
+
+    if constexpr (requires { container.resize(datarefSize); }) { // vector等
+        if (container.size() < datarefSize)
+            container.resize(datarefSize);
+    }
+
+    const size_t copyCount = std::min(datarefSize, container.size());
     if (!ref.available) {
-        std::ranges::fill(container | std::views::take(size), defaultValue);
+        std::ranges::fill(container | std::views::take(copyCount), defaultValue);
         return false;
     }
-    size_t containerCapacity; // 容器能塞多少元素
-    if constexpr (requires { container.capacity(); }) { // vector等
-        containerCapacity = container.capacity();
-    } else if constexpr (requires { container.size(); }) { // array等
-        containerCapacity = container.size();
-    }
-    auto source = values | std::views::drop(ref.start) | std::views::take(std::min(size, containerCapacity));
+
+    auto source = values | std::views::drop(ref.start) | std::views::take(copyCount);
     std::ranges::copy(source, container.begin());
     return true;
 }

@@ -77,10 +77,11 @@ void XPlaneUdp::reconnect (const bool del) {
         if (!available)
             continue;
         for (int i = start; i <= end; ++i) {
+            const int32_t sendFreq = del ? 0 : freq;
             std::string combine = isArray ? std::format("{}[{}]", name, i - start) : name;
-            const size_t size = packSize(0, DATAREF_GET_HEAD, del ? 0 : freq, i, combine);
+            const size_t size = packSize(0, DATAREF_GET_HEAD, sendFreq, i, combine);
             auto buffer = BufferPool::getBuffer(size);
-            pack(*buffer, 0, DATAREF_GET_HEAD, freq, i, combine);
+            pack(*buffer, 0, DATAREF_GET_HEAD, sendFreq, i, combine);
             sendData(buffer, 413);
         }
     }
@@ -104,10 +105,8 @@ void XPlaneUdp::stop () {
  * @brief 彻底关闭 UDP
  */
 void XPlaneUdp::close () {
-    static bool closed = false;
-    if (closed)
+    if (closed.exchange(true))
         return;
-    closed = true;
     if (xpSocket.is_open()) {
         xpSocket.cancel();
         xpSocket.close();
@@ -375,8 +374,12 @@ void XPlaneUdp::receiveDataProcess (const std::shared_ptr<std::array<char, 1472>
             int index;
             float value;
             unpack(*data, i, index, value);
-            // 这里访问越界,并导致了最终析构时的错误.很难想象这里会运行时无异常,导致析构时异常,并且debug/release/Qt下异常行为不同
-            values.at(index) = value;
+            if (index < 0)
+                continue;
+            const auto uindex = static_cast<size_t>(index);
+            if (uindex >= values.size())
+                continue;
+            values[uindex] = value;
         }
     } else if (compareHead(BASIC_INFO_HEAD, *data)) { // 基本信息
         std::unique_lock lock(dataMutex);
